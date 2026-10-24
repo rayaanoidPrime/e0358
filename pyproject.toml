@@ -1,0 +1,22 @@
+[project]
+name = "e0358"
+version = "0.1.0"
+description = "E0358 compiler course assignments"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.8.0",
+    "torch-xla==2.8.0",
+]
+
+[project.scripts]
+e0358 = "e0358:main"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "black>=26.10.1",
+]
