@@ -19,6 +19,17 @@ LLVM_LIB = Path(str(LLVM_BIN.parent / "lib")).expanduser()
 # TODO for further optimizations
 GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "1,128")
 
+# nvidia target for the gpu path (e.g., sm_86)
+GPU_CHIP = os.environ.get("E0358_GPU_CHIP")
+
+
+def gpu_chip(device):
+    """Returns the sm_XY target to compile the kernels for."""
+    if GPU_CHIP:
+        return GPU_CHIP
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"sm_{major}{minor}"
+
 
 def memref_descriptor(t):
     """Returns an MLIR memref descriptor viewing the memory of tensor 't'."""
@@ -43,31 +54,31 @@ def memref_descriptor(t):
 
 
 def make_callable(lib, meta, device):
-    """Returns a callable that invokes the compiled MLIR function."""
     func = lib._mlir_ciface_main
     func.restype = None
     # MLIR argument k is fed by user input input_locations[k].position
     order = [loc.position for loc in meta.input_locations]
 
     def callable_fn(*args):
-           # outputs are allocated here and passed as out-params; on cuda the
-           # descriptors carry device pointers, which the kernels use directly
-           outs = [
-               torch.empty(s.shape, dtype=getattr(torch, s.dtype), device=device)
-               for s in meta.output_signature
-           ]
-           # we pass identity-layout bufferization
-           # so we need contiguous row-major tensors
-           tensors = [args[i].contiguous() for i in order] + outs
-           if device.type == "cuda":
-               # the mlir cuda runtime launches on its own non-blocking stream,
-               # so wait for torch's pending work
-               # the launch itself synchronizes before returning
-               torch.cuda.synchronize(device)
-           func(*(ctypes.byref(memref_descriptor(t)) for t in tensors))
-           return tuple(outs)
+        # outputs are allocated here and passed as out-params; on cuda the
+        # descriptors carry device pointers, which the kernels use directly
+        outs = [
+            torch.empty(s.shape, dtype=getattr(torch, s.dtype), device=device)
+            for s in meta.output_signature
+        ]
+        # we pass identity-layout bufferization
+        # so we need contiguous row-major tensors
+        tensors = [args[i].contiguous() for i in order] + outs
+        if device.type == "cuda":
+            # the mlir cuda runtime launches on its own non-blocking stream,
+            # so wait for torch's pending work
+            # the launch itself synchronizes before returning
+            torch.cuda.synchronize(device)
+        func(*(ctypes.byref(memref_descriptor(t)) for t in tensors))
+        return tuple(outs)
 
     return callable_fn
+
 
 def check_no_host_allocs(path):
     # Fails if 'path' has heap allocations, which would be host memory
@@ -77,12 +88,13 @@ def check_no_host_allocs(path):
             "and the kernels cannot access them"
         )
 
+
 @torch._dynamo.register_backend(name="e0358")
 def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     sample_inputs = tuple(example_inputs)
     device = example_inputs[0].device
-    if device.type == "cuda":
-        major, minor = torch.cuda.get_device_capability(device)
+    # only queried on cuda: the cpu path must work without a gpu
+    chip = gpu_chip(device) if device.type == "cuda" else None
     # export to torch.export fx graph
     exported = export(gm, sample_inputs)
 
@@ -123,49 +135,49 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
 
     # Fused affine -> llvm ir for cpu path
     cpu_passes = [
-            # vectorize (8 x f32 = AVX2) and parallelize the outermost loop only
-            # (nested regions cost more)
-            [
-                LLVM_BIN / "mlir-opt",
-                "artifacts/bnc.affine.mlir",
-                # parallelize first: it can't see through vector.transfer ops
-                "--affine-parallelize=max-nested=1",
-                "--affine-super-vectorize=virtual-vector-size=8",
-                "-o",
-                "artifacts/bnc.cpu.affine.mlir",
-            ],
-            # lower to llvm dialect; parallel loops run on OpenMP threads.
-            # canonicalize drops the empty memref.alloca_scope that scf-to-openmp
-            # wraps around the body, which scf-to-cf would otherwise break
-            [
-                LLVM_BIN / "mlir-opt",
-                "artifacts/bnc.cpu.affine.mlir",
-                "--llvm-request-c-wrappers",
-                "--lower-affine",
-                "--convert-vector-to-scf",
-                "--convert-scf-to-openmp",
-                "--canonicalize",
-                "--convert-scf-to-cf",
-                "--convert-vector-to-llvm",
-                "--expand-strided-metadata",
-                "--convert-arith-to-llvm",
-                "--convert-index-to-llvm",
-                "--finalize-memref-to-llvm",
-                "--convert-func-to-llvm",
-                "--convert-cf-to-llvm",
-                "--convert-openmp-to-llvm",
-                "--reconcile-unrealized-casts",
-                "-o",
-                "artifacts/bnc.cpu.llvm.mlir",
-            ],
-            [
-                LLVM_BIN / "mlir-translate",
-                "--mlir-to-llvmir",
-                "artifacts/bnc.cpu.llvm.mlir",
-                "-o",
-                "artifacts/bnc.cpu.ll",
-            ],
-        ]
+        # vectorize (8 x f32 = AVX2) and parallelize the outermost loop only
+        # (nested regions cost more)
+        [
+            LLVM_BIN / "mlir-opt",
+            "artifacts/bnc.affine.mlir",
+            # parallelize first: it can't see through vector.transfer ops
+            "--affine-parallelize=max-nested=1",
+            "--affine-super-vectorize=virtual-vector-size=8",
+            "-o",
+            "artifacts/bnc.cpu.affine.mlir",
+        ],
+        # lower to llvm dialect; parallel loops run on OpenMP threads.
+        # canonicalize drops the empty memref.alloca_scope that scf-to-openmp
+        # wraps around the body, which scf-to-cf would otherwise break
+        [
+            LLVM_BIN / "mlir-opt",
+            "artifacts/bnc.cpu.affine.mlir",
+            "--llvm-request-c-wrappers",
+            "--lower-affine",
+            "--convert-vector-to-scf",
+            "--convert-scf-to-openmp",
+            "--canonicalize",
+            "--convert-scf-to-cf",
+            "--convert-vector-to-llvm",
+            "--expand-strided-metadata",
+            "--convert-arith-to-llvm",
+            "--convert-index-to-llvm",
+            "--finalize-memref-to-llvm",
+            "--convert-func-to-llvm",
+            "--convert-cf-to-llvm",
+            "--convert-openmp-to-llvm",
+            "--reconcile-unrealized-casts",
+            "-o",
+            "artifacts/bnc.cpu.llvm.mlir",
+        ],
+        [
+            LLVM_BIN / "mlir-translate",
+            "--mlir-to-llvmir",
+            "artifacts/bnc.cpu.llvm.mlir",
+            "-o",
+            "artifacts/bnc.cpu.ll",
+        ],
+    ]
 
     # fused affine -> llvm ir for gpu path
     gpu_passes = [
@@ -191,7 +203,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             LLVM_BIN / "mlir-opt",
             "artifacts/bnc.gpu.mlir",
             "--llvm-request-c-wrappers",
-            f"--gpu-lower-to-nvvm-pipeline=cubin-chip={f'sm_{major}{minor}'} opt-level=3",
+            "--gpu-lower-to-nvvm-pipeline=" f"cubin-chip={chip} opt-level=3",
             "-o",
             "artifacts/bnc.gpu.llvm.mlir",
         ],
@@ -214,7 +226,10 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         check_no_host_allocs("artifacts/bnc.affine.mlir")
         for cmd in gpu_passes:
             result = subprocess.run(
-                [str(c) for c in cmd], check=True, capture_output=True, text=True
+                [str(c) for c in cmd],
+                check=True,
+                capture_output=True,
+                text=True,
             )
             print(result.stdout)
             print(result.stderr)
@@ -229,7 +244,10 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     else:
         for cmd in cpu_passes:
             result = subprocess.run(
-                [str(c) for c in cmd], check=True, capture_output=True, text=True
+                [str(c) for c in cmd],
+                check=True,
+                capture_output=True,
+                text=True,
             )
             print(result.stdout)
             print(result.stderr)
