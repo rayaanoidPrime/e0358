@@ -15,9 +15,8 @@ LLVM_BIN = Path("~/llvm/llvm-project/build/bin").expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
 LLVM_LIB = Path(str(LLVM_BIN.parent / "lib")).expanduser()
 
-# scf-parallel-loop-tiling sizes for the gpu path, one per parallel loop
-# TODO for further optimizations
-GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "1,128")
+# threads per GPU block after coalescing each loop nest to one dimension
+GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "256")
 
 # nvidia target for the gpu path (e.g., sm_86)
 GPU_CHIP = os.environ.get("E0358_GPU_CHIP")
@@ -214,13 +213,11 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         [
             LLVM_BIN / "mlir-opt",
             "artifacts/bnc.affine.mlir",
+            "--affine-loop-coalescing",
             "--affine-parallelize",
             "--lower-affine",
             f"--scf-parallel-loop-tiling=parallel-loop-tile-sizes="
             f"{GPU_TILE_SIZES}",
-            # folds tiling steps and empty reductions so the GPU mapping
-            # pass recognizes the parallel loops
-            "--canonicalize",
             "--gpu-map-parallel-loops",
             "--convert-parallel-loops-to-gpu",
             "--gpu-kernel-outlining",
