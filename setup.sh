@@ -59,9 +59,40 @@ fi
 LLVM_CCACHE=OFF
 command -v ccache >/dev/null && LLVM_CCACHE=ON
 
+missing=()
 for tool in git cmake ninja; do
-  command -v $tool >/dev/null || { echo "error: $tool not found" >&2; exit 1; }
+  command -v $tool >/dev/null || missing+=($tool)
 done
+if [ ${#missing[@]} -gt 0 ]; then
+  if [ "$(id -u)" = 0 ] && command -v apt-get >/dev/null; then
+    echo "== installing build tools: ${missing[*]}"
+    apt-get update
+    apt-get install -y git cmake ninja-build clang lld ccache
+  else
+    echo "error: missing build tools: ${missing[*]}" >&2
+    exit 1
+  fi
+fi
+
+# CUDA 13 ships CCCL headers separately; CudaRuntimeWrappers needs <nv/target>.
+find_cccl() {
+  python3 - <<'PY'
+import glob, site
+for base in site.getsitepackages() + [site.getusersitepackages()]:
+    for hit in glob.glob(base + "/nvidia/*/include/cccl/nv/target"):
+        print(hit[: -len("/nv/target")])
+        raise SystemExit
+PY
+}
+if [ "$E0358_CUDA" = ON ]; then
+  CCCL_INC=$(find_cccl)
+  if [ -z "$CCCL_INC" ]; then
+    echo "== installing CUDA CCCL headers"
+    python3 -m pip install --quiet nvidia-cuda-cccl
+    CCCL_INC=$(find_cccl)
+  fi
+  [ -n "$CCCL_INC" ] && CMAKE_COMMON+=(-DCMAKE_CXX_FLAGS="-I$CCCL_INC")
+fi
 mkdir -p "$ROOT"
 
 echo "== llvm $LLVM_TAG + ${#PATCHES[@]} patch(es) on $BRANCH"
@@ -86,7 +117,14 @@ else
   ident=()
   git config user.email >/dev/null ||
     ident=(-c user.name=e0358 -c user.email=e0358@localhost)
-  git "${ident[@]}" am --3way "${PATCHES[@]}"
+  for p in "${PATCHES[@]}"; do
+    # Accept both git format-patch mailboxes and plain `git diff` files.
+    if grep -q '^From ' "$p"; then
+      git "${ident[@]}" am --3way "$p"
+    else
+      git apply "$p"
+    fi
+  done
 fi
 git log --oneline "$LLVM_TAG^..HEAD"
 

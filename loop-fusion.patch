@@ -1,31 +1,38 @@
 diff --git a/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp b/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
-index 1ec5fbfef50c..0dc22e298d3f 100644
+index 1ec5fbfef50c..a46bab521951 100644
 --- a/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
 +++ b/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
-@@ -788,6 +788,9 @@ public:
+@@ -788,6 +788,11 @@ public:
    // The amount of additional computation that is tolerated while fusing
    // pair-wise as a fraction of the total computation.
    double computeToleranceThreshold;
 +  // Keep multi-user producers alive until their last consumer is fused.
 +  bool replicateMultiUserProducers = false;
++  // Defer single-user producers that feed a multi-user producer.
++  bool deferIntoMultiUserProducers = false;
 +  DenseSet<unsigned> unprofitableMultiUserProducers;
  
    using Node = MemRefDependenceGraph::Node;
  
-@@ -816,8 +819,12 @@ public:
+@@ -816,8 +821,17 @@ public:
  
    /// Run only producer/consumer fusion on the `mdg`.
    void runProducerConsumerFusionOnly() {
-+    replicateMultiUserProducers = !maximalFusion;
++    // Stabilize single-user chains first without running the multi-user
++    // preflight or caching its (possibly temporary) failures.
++    deferIntoMultiUserProducers = !maximalFusion;
 +    unprofitableMultiUserProducers.clear();
 +    fuseProducerConsumerNodes(/*maxSrcUserCount=*/1);
++
++    replicateMultiUserProducers = !maximalFusion;
      fuseProducerConsumerNodes(
          /*maxSrcUserCount=*/std::numeric_limits<unsigned>::max());
 +    replicateMultiUserProducers = false;
++    deferIntoMultiUserProducers = false;
      eraseUnusedMemRefAllocations();
    }
  
-@@ -874,6 +881,112 @@ public:
+@@ -874,6 +888,115 @@ public:
      return true;
    }
  
@@ -51,12 +58,14 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
 +    slices.resize(maxDepth);
 +    unsigned maxLegalDepth = 0;
 +    FusionStrategy strategy(FusionStrategy::ProducerConsumer);
-+    for (unsigned depth = 1; depth <= maxDepth; ++depth)
-+      if (affine::canFuseLoops(srcForOp, dstForOp,
++    for (unsigned depth = 1; depth <= maxDepth; ++depth) {
++      FusionResult result =
++          affine::canFuseLoops(srcForOp, dstForOp,
 +                               depth + surroundingLoops.size(),
-+                               &slices[depth - 1], strategy)
-+              .value == FusionResult::Success)
++                               &slices[depth - 1], strategy);
++      if (result.value == FusionResult::Success)
 +        maxLegalDepth = depth;
++    }
 +    return maxLegalDepth;
 +  }
 +
@@ -101,6 +110,7 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
 +        return false;
 +      auto dstForOp = cast<AffineForOp>(dstNode->op);
 +
++      LDBG() << "Multi-user consumer " << dstId << ":\n" << *dstNode->op;
 +      DenseSet<Value> memrefs;
 +      gatherProducerConsumerMemrefs(srcId, dstId, *mdg, memrefs);
 +      SmallVector<ComputationSliceState, 8> slices;
@@ -138,7 +148,7 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
    /// Perform fusions with node `dstId` as the destination of fusion, with
    /// No fusion is performed when producers with a user count greater than
    /// `maxSrcUserCount` for any of the memrefs involved.
-@@ -918,6 +1031,9 @@ public:
+@@ -918,6 +1041,9 @@ public:
          // Get 'srcNode' from which to attempt fusion into 'dstNode'.
          auto *srcNode = mdg->getNode(srcId);
          auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
@@ -148,7 +158,7 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
  
          LDBG() << "Trying to fuse producer loop nest " << srcId
                 << " with consumer loop nest " << dstId;
-@@ -937,6 +1053,24 @@ public:
+@@ -937,6 +1063,24 @@ public:
          gatherProducerConsumerMemrefs(srcId, dstId, *mdg,
                                        producerConsumerMemrefs);
  
@@ -156,7 +166,7 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
 +            getAffineConsumers(srcId, producerConsumerMemrefs);
 +        bool hasMultipleConsumers = consumers.size() > 1;
 +
-+        if (replicateMultiUserProducers && !hasMultipleConsumers) {
++        if (deferIntoMultiUserProducers && !hasMultipleConsumers) {
 +          DenseSet<Value> dstStores;
 +          for (Operation *op : dstNode->stores)
 +            dstStores.insert(cast<AffineWriteOpInterface>(op).getMemRef());
@@ -173,7 +183,7 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
          // Skip if 'srcNode' out edge count on any memref is greater than
          // 'maxSrcUserCount'.
          if (any_of(producerConsumerMemrefs, [&](Value memref) {
-@@ -958,49 +1092,10 @@ public:
+@@ -958,49 +1102,10 @@ public:
          if (fusedLoopInsPoint == nullptr)
            continue;
  
@@ -226,7 +236,7 @@ index 1ec5fbfef50c..0dc22e298d3f 100644
          if (maxLegalFusionDepth == 0) {
            LDBG() << "Can't fuse: fusion is not legal at any depth";
            continue;
-@@ -1075,6 +1170,9 @@ public:
+@@ -1075,6 +1180,9 @@ public:
              srcId, dstId, bestSlice, fusedLoopInsPoint, srcEscapingMemRefs,
              *mdg);
  

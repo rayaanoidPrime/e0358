@@ -80,6 +80,25 @@ def make_callable(lib, meta, device):
     return callable_fn
 
 
+def move_allocs_to_device(path):
+    # gpu.alloc/gpu.dealloc lower to the CUDA runtime instead of host malloc.
+    text = Path(path).read_text()
+    allocs = []
+
+    def repl(match):
+        allocs.append((match.group(1), match.group(2)))
+        return f"%{match.group(1)} = gpu.alloc() : {match.group(2)}"
+
+    text = re.sub(
+        r"%(\w+) = memref\.alloc\(\)(?: \{alignment = \d+ : i64\})? : (memref<[^>]*>)",
+        repl,
+        text,
+    )
+    deallocs = "".join(f"    gpu.dealloc %{n} : {t}\n" for n, t in allocs)
+    text = text.replace("\n    return\n", "\n" + deallocs + "    return\n")
+    Path(path).write_text(text)
+
+
 def check_no_host_allocs(path):
     # Fails if 'path' has heap allocations, which would be host memory
     if re.search(r"memref\.alloc\(", Path(path).read_text()):
@@ -107,6 +126,16 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     with open("artifacts/bnc.stablehlo.mlir", "w") as f:
         f.write(stable_hlo_text)
 
+    fusion_mode = os.environ.get("E0358_FUSION_MODE", "greedy")
+    fusion_pass = (
+        "--canonicalize"
+        if fusion_mode == "none"
+        else f"--affine-loop-fusion=mode={fusion_mode}"
+    )
+    if fusion_mode == "producer":
+        tolerance = os.environ.get("E0358_COMPUTE_TOLERANCE", "0.25")
+        fusion_pass += f" compute-tolerance={tolerance}"
+
     # stablehlo -> mlir -> llvm lowering pipeline to artifacts/bnc.ll; each
     # entry is one tool invocation, run in order
     common_pipeline = [
@@ -126,10 +155,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--buffer-results-to-out-params="
             "hoist-static-allocs=true modify-public-functions=true",
             "--convert-linalg-to-affine-loops",
-            "--canonicalize"
-            if os.environ.get("E0358_FUSION_MODE") == "none"
-            else "--affine-loop-fusion=mode="
-            + os.environ.get("E0358_FUSION_MODE", "greedy"),
+            fusion_pass,
             "--affine-scalrep",
             "-o",
             "artifacts/bnc.affine.mlir",
@@ -228,6 +254,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     print(Path("artifacts/bnc.affine.mlir").read_text(), "\n...")
 
     if device.type == "cuda":
+        move_allocs_to_device("artifacts/bnc.affine.mlir")
         check_no_host_allocs("artifacts/bnc.affine.mlir")
         for cmd in gpu_passes:
             result = subprocess.run(
