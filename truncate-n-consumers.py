@@ -56,7 +56,11 @@ def main():
         from pathlib import Path
 
         ir = Path("artifacts/bnc.affine.mlir").read_text()
-        allocs = [line for line in ir.splitlines() if "memref.alloc" in line]
+        allocs = [
+            line
+            for line in ir.splitlines()
+            if "memref.alloc" in line or "gpu.alloc" in line
+        ]
         assert sum("memref<4096x4096xf16>" in line for line in allocs) == 1
         assert ir.count("arith.truncf") == NUM_CONSUMERS + 1
         print("  fusion check: truncation materialized once (not replicated).")

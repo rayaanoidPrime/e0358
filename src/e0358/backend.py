@@ -218,6 +218,9 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--lower-affine",
             f"--scf-parallel-loop-tiling=parallel-loop-tile-sizes="
             f"{GPU_TILE_SIZES}",
+            # folds tiling steps and empty reductions so the GPU mapping
+            # pass recognizes the parallel loops
+            "--canonicalize",
             "--gpu-map-parallel-loops",
             "--convert-parallel-loops-to-gpu",
             "--gpu-kernel-outlining",
