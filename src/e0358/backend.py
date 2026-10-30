@@ -9,11 +9,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-# llvm and stablehlo binary locations
-STABLEHLO_BIN = Path("~/llvm/stablehlo/build/bin").expanduser()
-LLVM_BIN = Path("~/llvm/llvm-project/build/bin").expanduser()
+# llvm and stablehlo build locations
+STABLEHLO_BIN = Path(os.environ["E0358_STABLEHLO_BIN"]).expanduser()
+LLVM_BIN = Path(os.environ["E0358_LLVM_BIN"]).expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
-LLVM_LIB = Path(str(LLVM_BIN.parent / "lib")).expanduser()
+LLVM_LIB = Path(os.environ["E0358_LLVM_LIB"]).expanduser()
 
 # threads per GPU block after coalescing each loop nest to one dimension
 GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "256")
