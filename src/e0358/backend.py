@@ -126,7 +126,10 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--buffer-results-to-out-params="
             "hoist-static-allocs=true modify-public-functions=true",
             "--convert-linalg-to-affine-loops",
-            "--affine-loop-fusion=mode=greedy",
+            "--canonicalize"
+            if os.environ.get("E0358_FUSION_MODE") == "none"
+            else "--affine-loop-fusion=mode="
+            + os.environ.get("E0358_FUSION_MODE", "greedy"),
             "--affine-scalrep",
             "-o",
             "artifacts/bnc.affine.mlir",
@@ -221,6 +224,8 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         )
         print(result.stdout)
         print(result.stderr)
+
+    print(Path("artifacts/bnc.affine.mlir").read_text(), "\n...")
 
     if device.type == "cuda":
         check_no_host_allocs("artifacts/bnc.affine.mlir")
