@@ -88,6 +88,7 @@ if [ "$E0358_CUDA" = ON ]; then
   CCCL_INC=$(find_cccl)
   if [ -z "$CCCL_INC" ]; then
     echo "== installing CUDA CCCL headers"
+    python3 -m pip --version >/dev/null || apt-get install -y python3-pip
     python3 -m pip install --quiet nvidia-cuda-cccl
     CCCL_INC=$(find_cccl)
   fi
@@ -126,7 +127,7 @@ else
     fi
   done
 fi
-git log --oneline "$LLVM_TAG^..HEAD"
+git log --oneline "$LLVM_TAG..HEAD"
 
 cmake -S llvm -B build "${CMAKE_COMMON[@]}" \
   -DLLVM_ENABLE_PROJECTS=mlir \
