@@ -1,0 +1,31 @@
+From 5da7b1ed9d758d23350bae3a4b5d25122ca60a09 Mon Sep 17 00:00:00 2001
+From: e0358 <e0358@localhost>
+Date: Wed, 25 Nov 2026 12:33:42 +0000
+Subject: [PATCH] Use tablegen_internal for mlir_builder_tblgen
+
+llvm-project d6a4b2ad0b90 ("[CMake][NFC] Add llvm_tablegen and use it
+instead of tablegen(LLVM ...)") renamed the generic tablegen() CMake
+function to tablegen_internal(), with the same calling convention.
+stablehlo b26a2e2a6e91 still calls tablegen() in MlirBuilderTblgen.cmake,
+so configuring it against that LLVM fails with 'Unknown CMake command
+"tablegen"'.
+---
+ stablehlo/integrations/cpp/builder/MlirBuilderTblgen.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/stablehlo/integrations/cpp/builder/MlirBuilderTblgen.cmake b/stablehlo/integrations/cpp/builder/MlirBuilderTblgen.cmake
+index 52e27dc1..a531cf35 100644
+--- a/stablehlo/integrations/cpp/builder/MlirBuilderTblgen.cmake
++++ b/stablehlo/integrations/cpp/builder/MlirBuilderTblgen.cmake
+@@ -20,7 +20,7 @@ set(MLIR_BUILDER_TABLEGEN_EXE mlir_builder_tblgen CACHE STRING
+      "The target name or path to the executable to use for mlir_builder_tblgen")
+ 
+ function(mlir_builder_tblgen ofn)
+-  tablegen(MLIR_BUILDER ${ARGV})
++  tablegen_internal(MLIR_BUILDER ${ARGV})
+   set(TABLEGEN_OUTPUT ${TABLEGEN_OUTPUT} ${CMAKE_CURRENT_BINARY_DIR}/${ofn}
+       PARENT_SCOPE)
+ 
+-- 
+2.43.0
+

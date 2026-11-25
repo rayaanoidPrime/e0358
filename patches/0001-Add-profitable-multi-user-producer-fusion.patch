@@ -1,5 +1,14 @@
+From 014e3f9bd83155872e3ea37da4a9b35e42f2b695 Mon Sep 17 00:00:00 2001
+From: e0358 <e0358@localhost>
+Date: Fri, 30 Oct 2026 10:09:49 +0000
+Subject: [PATCH] Add profitable multi-user producer fusion
+
+---
+ .../Dialect/Affine/Transforms/LoopFusion.cpp  | 189 ++++++++++++++----
+ 1 file changed, 147 insertions(+), 42 deletions(-)
+
 diff --git a/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp b/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
-index 1ec5fbfef50c..a46bab521951 100644
+index 77eda4062ec0..b8849aef9476 100644
 --- a/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
 +++ b/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
 @@ -788,6 +788,11 @@ public:
@@ -32,7 +41,7 @@ index 1ec5fbfef50c..a46bab521951 100644
      eraseUnusedMemRefAllocations();
    }
  
-@@ -874,6 +888,115 @@ public:
+@@ -874,6 +888,113 @@ public:
      return true;
    }
  
@@ -59,10 +68,9 @@ index 1ec5fbfef50c..a46bab521951 100644
 +    unsigned maxLegalDepth = 0;
 +    FusionStrategy strategy(FusionStrategy::ProducerConsumer);
 +    for (unsigned depth = 1; depth <= maxDepth; ++depth) {
-+      FusionResult result =
-+          affine::canFuseLoops(srcForOp, dstForOp,
-+                               depth + surroundingLoops.size(),
-+                               &slices[depth - 1], strategy);
++      FusionResult result = affine::canFuseLoops(
++          srcForOp, dstForOp, depth + surroundingLoops.size(),
++          &slices[depth - 1], strategy);
 +      if (result.value == FusionResult::Success)
 +        maxLegalDepth = depth;
 +    }
@@ -140,15 +148,14 @@ index 1ec5fbfef50c..a46bab521951 100644
 +    }
 +
 +    double additionalCompute = hasCompute ? fusedCost / originalCost - 1 : 0;
-+    LDBG() << "Multi-user additional compute fraction: "
-+           << additionalCompute;
++    LDBG() << "Multi-user additional compute fraction: " << additionalCompute;
 +    return additionalCompute <= threshold;
 +  }
 +
    /// Perform fusions with node `dstId` as the destination of fusion, with
    /// No fusion is performed when producers with a user count greater than
    /// `maxSrcUserCount` for any of the memrefs involved.
-@@ -918,6 +1041,9 @@ public:
+@@ -918,6 +1039,9 @@ public:
          // Get 'srcNode' from which to attempt fusion into 'dstNode'.
          auto *srcNode = mdg->getNode(srcId);
          auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
@@ -158,7 +165,7 @@ index 1ec5fbfef50c..a46bab521951 100644
  
          LDBG() << "Trying to fuse producer loop nest " << srcId
                 << " with consumer loop nest " << dstId;
-@@ -937,6 +1063,24 @@ public:
+@@ -937,6 +1061,24 @@ public:
          gatherProducerConsumerMemrefs(srcId, dstId, *mdg,
                                        producerConsumerMemrefs);
  
@@ -183,7 +190,7 @@ index 1ec5fbfef50c..a46bab521951 100644
          // Skip if 'srcNode' out edge count on any memref is greater than
          // 'maxSrcUserCount'.
          if (any_of(producerConsumerMemrefs, [&](Value memref) {
-@@ -958,49 +1102,10 @@ public:
+@@ -958,49 +1100,9 @@ public:
          if (fusedLoopInsPoint == nullptr)
            continue;
  
@@ -231,12 +238,11 @@ index 1ec5fbfef50c..a46bab521951 100644
 -        }
 -
 +        unsigned maxLegalFusionDepth = computeFusionSlices(
-+            srcAffineForOp, dstNode, producerConsumerMemrefs,
-+            depthSliceUnions);
++            srcAffineForOp, dstNode, producerConsumerMemrefs, depthSliceUnions);
          if (maxLegalFusionDepth == 0) {
            LDBG() << "Can't fuse: fusion is not legal at any depth";
            continue;
-@@ -1075,6 +1180,9 @@ public:
+@@ -1075,6 +1177,9 @@ public:
              srcId, dstId, bestSlice, fusedLoopInsPoint, srcEscapingMemRefs,
              *mdg);
  
@@ -246,3 +252,6 @@ index 1ec5fbfef50c..a46bab521951 100644
          DenseSet<Value> privateMemrefs;
          for (Value memref : producerConsumerMemrefs) {
            if (canCreatePrivateMemRef(memref, srcEscapingMemRefs, srcId, dstId,
+-- 
+2.43.0
+
