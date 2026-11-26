@@ -7,6 +7,7 @@ import ctypes
 import functools
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -24,6 +25,9 @@ GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "256")
 
 # nvidia target for the gpu path (e.g., sm_86)
 GPU_CHIP = os.environ.get("E0358_GPU_CHIP")
+
+# prefix of the IR files written at each stage: artifacts/<script>.<stage>
+ARTIFACTS = f"artifacts/{Path(sys.argv[0]).stem or 'e0358'}"
 
 # builds the CUDA Tile IR kernels of a matmul function and prints the line
 # each kernel is launched from, e.g.
@@ -189,7 +193,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
     print(stable_hlo_text, "\n...")
 
     Path("artifacts").mkdir(parents=True, exist_ok=True)
-    with open("artifacts/bnc.stablehlo.mlir", "w") as f:
+    with open(f"{ARTIFACTS}.stablehlo.mlir", "w") as f:
         f.write(stable_hlo_text)
 
     fusion_mode = os.environ.get("E0358_FUSION_MODE", "greedy")
@@ -202,20 +206,20 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         tolerance = os.environ.get("E0358_COMPUTE_TOLERANCE", "0.25")
         fusion_pass += f" compute-tolerance={tolerance}"
 
-    # stablehlo -> mlir -> llvm lowering pipeline to artifacts/bnc.ll; each
+    # stablehlo -> mlir -> llvm lowering pipeline to <ARTIFACTS>.*.ll; each
     # entry is one tool invocation, run in order
     common_pipeline = [
         [
             STABLEHLO_BIN / "stablehlo-opt",
             "--stablehlo-legalize-to-linalg",
-            "artifacts/bnc.stablehlo.mlir",
+            f"{ARTIFACTS}.stablehlo.mlir",
             "-o",
-            "artifacts/bnc.linalg.mlir",
+            f"{ARTIFACTS}.linalg.mlir",
         ],
         # lower linalg to affine loops
         [
             LLVM_BIN / "mlir-opt",
-            "artifacts/bnc.linalg.mlir",
+            f"{ARTIFACTS}.linalg.mlir",
             "--one-shot-bufferize=bufferize-function-boundaries "
             "function-boundary-type-conversion=identity-layout-map",
             "--buffer-results-to-out-params="
@@ -223,16 +227,16 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--convert-linalg-to-affine-loops",
             "--canonicalize",
             "-o",
-            "artifacts/bnc.loops.mlir",
+            f"{ARTIFACTS}.loops.mlir",
         ],
         # fuse
         [
             LLVM_BIN / "mlir-opt",
-            "artifacts/bnc.loops.mlir",
+            f"{ARTIFACTS}.loops.mlir",
             fusion_pass,
             "--affine-scalrep",
             "-o",
-            "artifacts/bnc.affine.mlir",
+            f"{ARTIFACTS}.affine.mlir",
         ],
     ]
 
@@ -242,19 +246,19 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         # (nested regions cost more)
         [
             LLVM_BIN / "mlir-opt",
-            "artifacts/bnc.affine.mlir",
+            f"{ARTIFACTS}.affine.mlir",
             # parallelize first: it can't see through vector.transfer ops
             "--affine-parallelize=max-nested=1",
             "--affine-super-vectorize=virtual-vector-size=8",
             "-o",
-            "artifacts/bnc.cpu.affine.mlir",
+            f"{ARTIFACTS}.cpu.affine.mlir",
         ],
         # lower to llvm dialect; parallel loops run on OpenMP threads.
         # canonicalize drops the empty memref.alloca_scope that scf-to-openmp
         # wraps around the body, which scf-to-cf would otherwise break
         [
             LLVM_BIN / "mlir-opt",
-            "artifacts/bnc.cpu.affine.mlir",
+            f"{ARTIFACTS}.cpu.affine.mlir",
             "--llvm-request-c-wrappers",
             "--lower-affine",
             "--convert-vector-to-scf",
@@ -271,14 +275,14 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--convert-openmp-to-llvm",
             "--reconcile-unrealized-casts",
             "-o",
-            "artifacts/bnc.cpu.llvm.mlir",
+            f"{ARTIFACTS}.cpu.llvm.mlir",
         ],
         [
             LLVM_BIN / "mlir-translate",
             "--mlir-to-llvmir",
-            "artifacts/bnc.cpu.llvm.mlir",
+            f"{ARTIFACTS}.cpu.llvm.mlir",
             "-o",
-            "artifacts/bnc.cpu.ll",
+            f"{ARTIFACTS}.cpu.ll",
         ],
     ]
 
@@ -287,7 +291,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         # map parallel loops to blocks/threads and outline kernels
         [
             LLVM_BIN / "mlir-opt",
-            "artifacts/bnc.affine.mlir",
+            f"{ARTIFACTS}.affine.mlir",
             "--affine-loop-coalescing",
             "--affine-parallelize",
             "--lower-affine",
@@ -300,23 +304,23 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--convert-scf-to-cf",
             "--canonicalize",
             "-o",
-            "artifacts/bnc.gpu.mlir",
+            f"{ARTIFACTS}.gpu.mlir",
         ],
         # kernels -> nvvm -> cubin (embedded), host -> llvm + mgpu* calls
         [
             LLVM_BIN / "mlir-opt",
-            "artifacts/bnc.gpu.mlir",
+            f"{ARTIFACTS}.gpu.mlir",
             "--llvm-request-c-wrappers",
             "--gpu-lower-to-nvvm-pipeline=" f"cubin-chip={chip} opt-level=3",
             "-o",
-            "artifacts/bnc.gpu.llvm.mlir",
+            f"{ARTIFACTS}.gpu.llvm.mlir",
         ],
         [
             LLVM_BIN / "mlir-translate",
             "--mlir-to-llvmir",
-            "artifacts/bnc.gpu.llvm.mlir",
+            f"{ARTIFACTS}.gpu.llvm.mlir",
             "-o",
-            "artifacts/bnc.gpu.ll",
+            f"{ARTIFACTS}.gpu.ll",
         ],
     ]
     for cmd in common_pipeline:
@@ -326,7 +330,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         print(result.stdout)
         print(result.stderr)
 
-    print(Path("artifacts/bnc.affine.mlir").read_text(), "\n...")
+    print(Path(f"{ARTIFACTS}.affine.mlir").read_text(), "\n...")
     meta = stablehlo_program._bundle.stablehlo_funcs[0].meta
 
     if device.type == "cuda":
@@ -337,8 +341,8 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             print(error.stderr)
 
     if device.type == "cuda":
-        move_allocs_to_device("artifacts/bnc.affine.mlir")
-        check_no_host_allocs("artifacts/bnc.affine.mlir")
+        move_allocs_to_device(f"{ARTIFACTS}.affine.mlir")
+        check_no_host_allocs(f"{ARTIFACTS}.affine.mlir")
         for cmd in gpu_passes:
             result = subprocess.run(
                 [str(c) for c in cmd],
@@ -349,7 +353,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             print(result.stdout)
             print(result.stderr)
 
-        ll = "artifacts/bnc.gpu.ll"
+        ll = f"{ARTIFACTS}.gpu.ll"
         # mgpu* runtime wrappers that the host code calls into
         link_flags = [
             f"-L{LLVM_LIB}",
@@ -367,7 +371,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             print(result.stdout)
             print(result.stderr)
 
-        ll = "artifacts/bnc.cpu.ll"
+        ll = f"{ARTIFACTS}.cpu.ll"
         link_flags = ["-fopenmp"]
 
     # a fresh path per compilation: dlopen caches libraries by path
@@ -407,7 +411,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
 
 
 def compile_tile(chip):
-    """CUDA Tile IR kernels for the matmuls of artifacts/bnc.loops.mlir,
+    """CUDA Tile IR kernels for the matmuls of <ARTIFACTS>.loops.mlir,
     siblings fused when E0358_SIBLING_FUSION=1."""
     fusion = os.environ.get("E0358_SIBLING_FUSION") == "1"
     work = Path(tempfile.mkdtemp(prefix="e0358-"))
@@ -418,11 +422,11 @@ def compile_tile(chip):
     ir = run(
         TILE_TOOL,
         *fuse,
-        "artifacts/bnc.loops.mlir",
+        f"{ARTIFACTS}.loops.mlir",
         "-o",
         work / "kernels.tilebc",
     )
-    Path("artifacts/bnc.tile.mlir").write_text(ir)
+    Path(f"{ARTIFACTS}.tile.mlir").write_text(ir)
     print(ir, "\n...")
     run(
         "tileiras",

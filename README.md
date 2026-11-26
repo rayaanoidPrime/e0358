@@ -164,9 +164,10 @@ On CUDA, the backend in `e0358.py` compiles a graph in these steps:
 1. `torch.export` and torch-xla export it to StableHLO.
 2. `stablehlo-opt --stablehlo-legalize-to-linalg`, then `mlir-opt` bufferizes
    (results become out-parameters) and lowers linalg to affine loops
-   (`artifacts/bnc.loops.mlir`).
+   (`artifacts/qkv-projection.loops.mlir`).
 3. `tools/e0358-tile` builds CUDA Tile IR kernels for the affine matmuls and
-   writes them as bytecode (the IR is printed to `artifacts/bnc.tile.mlir`).
+   writes them as bytecode (the IR is printed to
+   `artifacts/qkv-projection.tile.mlir`).
 4. `tileiras` compiles the bytecode to a cubin for the GPU (`sm_89`).
 5. `Kernels` loads the cubin with the CUDA driver API and launches the
    kernels on torch's current stream.
@@ -217,8 +218,8 @@ kernel with three accumulators. Each `k` step loads the tile of `x` once and
 uses it for all three `mmaf`s, instead of three kernels each loading it.
 
 Fusion is visible in the IR (one `entry @k0` with three `mmaf`s in
-`artifacts/bnc.tile.mlir`) and in nsys. At bert-base, one call launches
-`k0`, `k1` and `k2` without fusion, and only `k0` with fusion.
+`artifacts/qkv-projection.tile.mlir`) and in nsys. At bert-base, one call
+launches `k0`, `k1` and `k2` without fusion, and only `k0` with fusion.
 
 ## Results
 
