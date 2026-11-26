@@ -222,55 +222,76 @@ Fusion is visible in the IR (one `entry @k0` with three `mmaf`s in
 
 ## Results
 
-These are from an RTX 4090 (driver 595.58, CUDA 13.2), running
-`qkv-projection.py --backend e0358 [--dtype ...]` with no other process on
-the GPU; a second run agreed within 1% (4% for fused llama-7b). Each cell is
-the median of 50 iterations after 10 warmup iterations, in ms (TFLOP/s).
-All e0358 outputs pass validation against eager; in float32 the maximum
-absolute error is about 1e-6 to 8e-6, so `mmaf` does not round inputs to
-TF32.
+Measured on an RTX 4090 (driver 595.58, CUDA 13.2), with no other process on
+the GPU, by:
 
-float32 (the default):
+```sh
+python qkv-projection.py --backend e0358 --reference eager --device cuda \
+  --dtype {float32,float16,bfloat16} --fusion both --warmup 10 --iters 50 \
+  --stat {median,mean}
+```
 
-| variant           | bert-base (512x768x64) | gpt2-medium (1024x1024x1024) | llama-7b (4096x4096x128) |
-|-------------------|------------------------|------------------------------|--------------------------|
-| eager             | 0.027 (5.7)            | 0.135 (47.7)                 | 0.393 (32.8)             |
-| inductor          | 0.060 (2.5)            | 0.135 (47.7)                 | 0.393 (32.8)             |
-| tensorrt          | 0.092 (1.6)            | 0.161 (40.1)                 | 0.344 (37.4)             |
-| e0358 (no fusion) | 0.171 (0.9)            | 0.593 (10.9)                 | 1.248 (10.3)             |
-| e0358 (fusion)    | 0.077 (2.0)            | 0.497 (13.0)                 | 0.862 (14.9)             |
+Each cell is `median / mean` of 50 timed iterations after 10 warmup
+iterations, in ms. All e0358 outputs pass validation against eager in every
+dtype; in float32 the maximum absolute error is about 1e-6 to 8e-6, so `mmaf`
+does not round inputs to TF32.
 
-float16 (bfloat16 is within a few percent of these):
+**float32** (the default)
 
-| variant           | bert-base   | gpt2-medium   | llama-7b      |
-|-------------------|-------------|---------------|---------------|
-| eager             | 0.026 (5.9) | 0.063 (102.9) | 0.097 (132.4) |
-| inductor          | 0.059 (2.5) | 0.063 (103.0) | 0.097 (132.5) |
-| tensorrt          | 0.101 (1.5) | 0.111 (58.3)  | 0.114 (113.2) |
-| e0358 (no fusion) | 0.067 (2.3) | 0.319 (20.2)  | 0.612 (21.0)  |
-| e0358 (fusion)    | 0.039 (3.9) | 0.239 (27.0)  | 0.377 (34.2)  |
+| variant           | bert-base     | gpt2-medium   | llama-7b      |
+|-------------------|---------------|---------------|---------------|
+| eager             | 0.027 / 0.027 | 0.135 / 0.135 | 0.404 / 0.405 |
+| inductor          | 0.062 / 0.061 | 0.135 / 0.136 | 0.403 / 0.406 |
+| tensorrt          | 0.088 / 0.092 | 0.163 / 0.161 | 0.340 / 0.335 |
+| e0358 (no fusion) | 0.170 / 0.171 | 0.593 / 0.595 | 1.241 / 1.243 |
+| e0358 (fusion)    | 0.077 / 0.077 | 0.495 / 0.497 | 0.906 / 0.882 |
 
-How the variants compare:
+**float16**
 
-- **Fusion vs no fusion:** fusion is faster at every size, by 2.2x (bert-base),
-  1.2x (gpt2-medium) and 1.4x (llama-7b) in float32. It saves two of every
-  three loads of `x` and two of three kernel launches. The gain is largest at
-  bert-base, where each kernel has only 32 blocks for 128 SMs. There the time
-  is mostly fixed costs (launch, k-loop latency), which fusion pays once
-  instead of three times. It is smallest at gpt2-medium, where the three
-  1024x1024 weight matrices, not `x`, dominate memory traffic.
-- **e0358 vs eager and Inductor:** fused e0358 is 1.5x (float16 bert-base)
-  to 3.9x slower than eager. Inductor matches eager except at bert-base,
-  where it is slower in both dtypes. Eager's matmuls are cuBLAS kernels (nsys
-  shows `ampere_sgemm_*` for float32), hand-tuned for this GPU. Each e0358
-  kernel is one simple k-loop that leaves scheduling to `tileiras`. It has
-  no split-k, which would help bert-base, whose 512x64 outputs give only 32
+| variant           | bert-base     | gpt2-medium   | llama-7b      |
+|-------------------|---------------|---------------|---------------|
+| eager             | 0.025 / 0.025 | 0.063 / 0.063 | 0.097 / 0.098 |
+| inductor          | 0.063 / 0.063 | 0.063 / 0.064 | 0.097 / 0.098 |
+| tensorrt          | 0.103 / 0.107 | 0.111 / 0.114 | 0.118 / 0.120 |
+| e0358 (no fusion) | 0.067 / 0.067 | 0.321 / 0.320 | 0.615 / 0.614 |
+| e0358 (fusion)    | 0.039 / 0.039 | 0.240 / 0.240 | 0.378 / 0.378 |
+
+**bfloat16**
+
+| variant           | bert-base     | gpt2-medium   | llama-7b      |
+|-------------------|---------------|---------------|---------------|
+| eager             | 0.027 / 0.027 | 0.052 / 0.052 | 0.097 / 0.098 |
+| inductor          | 0.061 / 0.066 | 0.057 / 0.063 | 0.097 / 0.099 |
+| tensorrt          | 0.105 / 0.106 | 0.113 / 0.115 | 0.111 / 0.114 |
+| e0358 (no fusion) | 0.067 / 0.067 | 0.319 / 0.320 | 0.612 / 0.616 |
+| e0358 (fusion)    | 0.038 / 0.039 | 0.239 / 0.240 | 0.377 / 0.378 |
+
+The sizes (N x d_model x d) are 512x768x64 for bert-base, 1024x1024x1024 for
+gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 3%
+everywhere except Inductor in bfloat16 (up to 10%).
+
+How the variants compare (medians):
+
+- **Fusion vs no fusion:** fusion is faster at every size and dtype, by 2.2x
+  (bert-base), 1.2x (gpt2-medium) and 1.4x (llama-7b) in float32. It saves
+  two of every three loads of `x` and two of three kernel launches. The gain
+  is largest at bert-base, where each kernel has only 32 blocks for 128 SMs.
+  There the time is mostly fixed costs (launch, k-loop latency), which fusion
+  pays once instead of three times. It is smallest at gpt2-medium, where the
+  three 1024x1024 weight matrices, not `x`, dominate memory traffic.
+- **e0358 vs eager and Inductor:** fused e0358 is 1.4x (bfloat16 bert-base)
+  to 4.6x (bfloat16 gpt2-medium) slower than eager. Inductor is slower than
+  eager at bert-base in every dtype and at bfloat16 gpt2-medium, and matches
+  it elsewhere. Eager's matmuls are cuBLAS kernels (nsys shows
+  `ampere_sgemm_*` for float32), hand-tuned for this GPU. Each e0358 kernel
+  is one simple k-loop that leaves scheduling to `tileiras`. It has no
+  split-k, which would help bert-base, whose 512x64 outputs give only 32
   blocks for 128 SMs. It has no load latency hints, and its tile sizes come
   from a coarse sweep. In float16 it reaches 27 to 34 TFLOP/s fused, against
-  eager's 103 to 132.
+  eager's 102 to 133.
 - **TensorRT:** it takes about 0.1 ms even at bert-base, which makes it the
   slowest baseline there. In float32 it beats eager only at llama-7b; in
-  float16, never.
+  float16 and bfloat16, never.
 
 ## AI-assisted parts
 
