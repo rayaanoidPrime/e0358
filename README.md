@@ -232,39 +232,40 @@ python qkv-projection.py --backend e0358 --reference eager --device cuda \
 ```
 
 Each cell is `median / mean` of 50 timed iterations after 10 warmup
-iterations, in ms. All e0358 outputs pass validation against eager in every
-dtype; in float32 the maximum absolute error is about 1e-6 to 8e-6, so `mmaf`
-does not round inputs to TF32.
+iterations, in ms; the fastest median and the fastest mean of each column are
+in bold (ties are all bold). All e0358 outputs pass validation against eager
+in every dtype; in float32 the maximum absolute error is about 1e-6 to 8e-6,
+so `mmaf` does not round inputs to TF32.
 
 **float32** (the default)
 
-| variant           | bert-base     | gpt2-medium   | llama-7b      |
-|-------------------|---------------|---------------|---------------|
-| eager             | 0.027 / 0.027 | 0.135 / 0.135 | 0.404 / 0.405 |
-| inductor          | 0.062 / 0.061 | 0.135 / 0.136 | 0.403 / 0.406 |
-| tensorrt          | 0.088 / 0.092 | 0.163 / 0.161 | 0.340 / 0.335 |
-| e0358 (no fusion) | 0.170 / 0.171 | 0.593 / 0.595 | 1.241 / 1.243 |
-| e0358 (fusion)    | 0.077 / 0.077 | 0.495 / 0.497 | 0.906 / 0.882 |
+| variant           | bert-base             | gpt2-medium           | llama-7b              |
+|-------------------|-----------------------|-----------------------|-----------------------|
+| eager             | **0.027** / **0.027** | **0.135** / **0.135** | 0.404 / 0.405         |
+| inductor          | 0.062 / 0.061         | **0.135** / 0.136     | 0.403 / 0.406         |
+| tensorrt          | 0.088 / 0.092         | 0.163 / 0.161         | **0.340** / **0.335** |
+| e0358 (no fusion) | 0.170 / 0.171         | 0.593 / 0.595         | 1.241 / 1.243         |
+| e0358 (fusion)    | 0.077 / 0.077         | 0.495 / 0.497         | 0.906 / 0.882         |
 
 **float16**
 
-| variant           | bert-base     | gpt2-medium   | llama-7b      |
-|-------------------|---------------|---------------|---------------|
-| eager             | 0.025 / 0.025 | 0.063 / 0.063 | 0.097 / 0.098 |
-| inductor          | 0.063 / 0.063 | 0.063 / 0.064 | 0.097 / 0.098 |
-| tensorrt          | 0.103 / 0.107 | 0.111 / 0.114 | 0.118 / 0.120 |
-| e0358 (no fusion) | 0.067 / 0.067 | 0.321 / 0.320 | 0.615 / 0.614 |
-| e0358 (fusion)    | 0.039 / 0.039 | 0.240 / 0.240 | 0.378 / 0.378 |
+| variant           | bert-base             | gpt2-medium           | llama-7b              |
+|-------------------|-----------------------|-----------------------|-----------------------|
+| eager             | **0.025** / **0.025** | **0.063** / **0.063** | **0.097** / **0.098** |
+| inductor          | 0.063 / 0.063         | **0.063** / 0.064     | **0.097** / **0.098** |
+| tensorrt          | 0.103 / 0.107         | 0.111 / 0.114         | 0.118 / 0.120         |
+| e0358 (no fusion) | 0.067 / 0.067         | 0.321 / 0.320         | 0.615 / 0.614         |
+| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.378 / 0.378         |
 
 **bfloat16**
 
-| variant           | bert-base     | gpt2-medium   | llama-7b      |
-|-------------------|---------------|---------------|---------------|
-| eager             | 0.027 / 0.027 | 0.052 / 0.052 | 0.097 / 0.098 |
-| inductor          | 0.061 / 0.066 | 0.057 / 0.063 | 0.097 / 0.099 |
-| tensorrt          | 0.105 / 0.106 | 0.113 / 0.115 | 0.111 / 0.114 |
-| e0358 (no fusion) | 0.067 / 0.067 | 0.319 / 0.320 | 0.612 / 0.616 |
-| e0358 (fusion)    | 0.038 / 0.039 | 0.239 / 0.240 | 0.377 / 0.378 |
+| variant           | bert-base             | gpt2-medium           | llama-7b              |
+|-------------------|-----------------------|-----------------------|-----------------------|
+| eager             | **0.027** / **0.027** | **0.052** / **0.052** | **0.097** / **0.098** |
+| inductor          | 0.061 / 0.066         | 0.057 / 0.063         | **0.097** / 0.099     |
+| tensorrt          | 0.105 / 0.106         | 0.113 / 0.115         | 0.111 / 0.114         |
+| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.320         | 0.612 / 0.616         |
+| e0358 (fusion)    | 0.038 / 0.039         | 0.239 / 0.240         | 0.377 / 0.378         |
 
 The sizes (N x d_model x d) are 512x768x64 for bert-base, 1024x1024x1024 for
 gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 3%
