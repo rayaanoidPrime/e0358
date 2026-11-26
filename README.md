@@ -223,8 +223,9 @@ Fusion is visible in the IR (one `entry @k0` with three `mmaf`s in
 ## Results
 
 These are from an RTX 4090 (driver 595.58, CUDA 13.2), running
-`qkv-projection.py --backend e0358 [--dtype ...]`. Each cell is the median of
-50 iterations after 10 warmup iterations, in ms (TFLOP/s). All e0358 outputs
+`qkv-projection.py --backend e0358 [--dtype ...]` with no other process on
+the GPU; a second run agreed within 1% (4% for fused llama-7b). Each cell is
+the median of 50 iterations after 10 warmup iterations, in ms (TFLOP/s). All e0358 outputs
 pass validation against eager; in float32 the maximum absolute error is about
 1e-6 to 8e-6, so `mmaf` does not round inputs to TF32.
 
@@ -232,21 +233,21 @@ float32 (the default):
 
 | variant           | bert-base (512x768x64) | gpt2-medium (1024x1024x1024) | llama-7b (4096x4096x128) |
 |-------------------|------------------------|------------------------------|--------------------------|
-| eager             | 0.022 (7.0)            | 0.135 (47.7)                 | 0.383 (33.6)             |
-| inductor          | 0.022 (7.0)            | 0.135 (47.7)                 | 0.384 (33.6)             |
-| tensorrt          | 0.091 (1.7)            | 0.161 (40.1)                 | 0.338 (38.1)             |
-| e0358 (no fusion) | 0.171 (0.9)            | 0.594 (10.8)                 | 1.244 (10.4)             |
-| e0358 (fusion)    | 0.077 (2.0)            | 0.496 (13.0)                 | 0.900 (14.3)             |
+| eager             | 0.027 (5.7)            | 0.135 (47.7)                 | 0.393 (32.8)             |
+| inductor          | 0.060 (2.5)            | 0.135 (47.7)                 | 0.393 (32.8)             |
+| tensorrt          | 0.092 (1.6)            | 0.161 (40.1)                 | 0.344 (37.4)             |
+| e0358 (no fusion) | 0.171 (0.9)            | 0.593 (10.9)                 | 1.248 (10.3)             |
+| e0358 (fusion)    | 0.077 (2.0)            | 0.497 (13.0)                 | 0.862 (14.9)             |
 
 float16 (bfloat16 is within a few percent of these):
 
 | variant           | bert-base   | gpt2-medium   | llama-7b      |
 |-------------------|-------------|---------------|---------------|
-| eager             | 0.026 (5.9) | 0.063 (103.0) | 0.097 (132.5) |
-| inductor          | 0.060 (2.5) | 0.062 (103.1) | 0.097 (132.5) |
-| tensorrt          | 0.105 (1.4) | 0.113 (57.2)  | 0.118 (108.8) |
-| e0358 (no fusion) | 0.067 (2.3) | 0.319 (20.2)  | 0.613 (21.0)  |
-| e0358 (fusion)    | 0.038 (4.0) | 0.241 (26.8)  | 0.377 (34.2)  |
+| eager             | 0.026 (5.9) | 0.063 (102.9) | 0.097 (132.4) |
+| inductor          | 0.059 (2.5) | 0.063 (103.0) | 0.097 (132.5) |
+| tensorrt          | 0.101 (1.5) | 0.111 (58.3)  | 0.114 (113.2) |
+| e0358 (no fusion) | 0.067 (2.3) | 0.319 (20.2)  | 0.612 (21.0)  |
+| e0358 (fusion)    | 0.039 (3.9) | 0.239 (27.0)  | 0.377 (34.2)  |
 
 How the variants compare:
 
@@ -258,14 +259,14 @@ How the variants compare:
   instead of three times. It is smallest at gpt2-medium, where the three
   1024x1024 weight matrices, not `x`, dominate memory traffic.
 - **e0358 vs eager and Inductor:** fused e0358 is 1.5x (float16 bert-base)
-  to 3.9x slower than eager. Inductor matches eager except at float16
-  bert-base, where it is slower. Eager's matmuls are cuBLAS kernels (nsys
+  to 3.9x slower than eager. Inductor matches eager except at bert-base,
+  where it is slower in both dtypes. Eager's matmuls are cuBLAS kernels (nsys
   shows `ampere_sgemm_*` for float32), hand-tuned for this GPU. Each e0358
   kernel is one simple k-loop that leaves scheduling to `tileiras`. It has
   no split-k, which would help bert-base, whose 512x64 outputs give only 32
   blocks for 128 SMs. It has no load latency hints, and its tile sizes come
   from a coarse sweep. In float16 it reaches 27 to 34 TFLOP/s fused, against
-  eager's 103 to 133.
+  eager's 103 to 132.
 - **TensorRT:** it takes about 0.1 ms even at bert-base, which makes it the
   slowest baseline there. In float32 it beats eager only at llama-7b; in
   float16, never.
