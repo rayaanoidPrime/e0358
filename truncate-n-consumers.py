@@ -25,7 +25,7 @@ import os
 
 import torch
 
-import common
+import common_asst_1 as common
 
 M, N = 4096, 4096
 NUM_CONSUMERS = 8

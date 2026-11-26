@@ -6,7 +6,12 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch==2.9.0",
+    "torch-tensorrt==2.9.0",
     "torch-xla==2.9.0",
+    # TensorRT for torch-tensorrt's CUDA 12.8 build (see tool.uv below)
+    "tensorrt-cu12>=10.13,<10.14",
+    "tensorrt-cu12-bindings>=10.13,<10.14",
+    "tensorrt-cu12-libs>=10.13,<10.14",
 ]
 
 [project.scripts]
@@ -20,3 +25,31 @@ build-backend = "uv_build"
 dev = [
     "black>=26.10.1",
 ]
+
+# torch-tensorrt from PyPI is built for CUDA 13.0, but torch 2.9.0 from PyPI
+# is a CUDA 12.8 build; take the matching +cu128 build from PyTorch's index,
+# and TensorRT's CUDA 12 wheels from NVIDIA's index (on PyPI they are source
+# packages that download the libraries while building).
+[tool.uv.sources]
+torch-tensorrt = { index = "pytorch-cu128" }
+tensorrt-cu12 = { index = "nvidia" }
+tensorrt-cu12-libs = { index = "nvidia" }
+tensorrt-cu12-bindings = { index = "nvidia" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv]
+# Both machines used (laptop and GPU server) are x86_64 Linux.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# torch-tensorrt also requires the generic 'tensorrt' metapackage, which now
+# installs the CUDA 13 TensorRT; the CUDA 12 packages above provide the same
+# 'tensorrt' module, so leave it out.
+override-dependencies = ["tensorrt ; sys_platform == 'never'"]

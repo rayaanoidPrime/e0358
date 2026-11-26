@@ -18,7 +18,7 @@ Usage:
 
 import torch
 
-import common
+import common_asst_1 as common
 
 M, N, K = 4096, 128, 32
 NUM_CONSUMERS = 8
