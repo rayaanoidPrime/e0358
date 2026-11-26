@@ -225,9 +225,10 @@ Fusion is visible in the IR (one `entry @k0` with three `mmaf`s in
 These are from an RTX 4090 (driver 595.58, CUDA 13.2), running
 `qkv-projection.py --backend e0358 [--dtype ...]` with no other process on
 the GPU; a second run agreed within 1% (4% for fused llama-7b). Each cell is
-the median of 50 iterations after 10 warmup iterations, in ms (TFLOP/s). All e0358 outputs
-pass validation against eager; in float32 the maximum absolute error is about
-1e-6 to 8e-6, so `mmaf` does not round inputs to TF32.
+the median of 50 iterations after 10 warmup iterations, in ms (TFLOP/s).
+All e0358 outputs pass validation against eager; in float32 the maximum
+absolute error is about 1e-6 to 8e-6, so `mmaf` does not round inputs to
+TF32.
 
 float32 (the default):
 
