@@ -121,6 +121,11 @@ This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB`, `E0358_STABLEHLO_BIN` and
   shared library (default `clang`). Set `E0358_CC=gcc` on machines without
   clang; this works for the GPU path, while the CPU path needs clang for the
   OpenMP runtime its `-fopenmp` provides.
+- `TMPDIR`: on a shared machine, set a per-user temp directory
+  (`mkdir -p /tmp/$USER && export TMPDIR=/tmp/$USER`). Torch-TensorRT keeps
+  its timing cache in `$TMPDIR/torch_tensorrt_engine_cache/`, and the
+  TensorRT baseline fails with `PermissionError` when another user already
+  owns `/tmp/torch_tensorrt_engine_cache`.
 - `E0358_GPU_CHIP`: the `sm_XY` target (e.g. `sm_89` for the RTX 4090), to
   override the GPU detected from the device.
 
