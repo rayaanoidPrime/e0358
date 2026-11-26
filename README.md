@@ -67,8 +67,8 @@ export PATH=$HOME/.local/bin:/usr/local/cuda/bin:$PATH  # also in ~/.bashrc
 `~/llvm`), applies `patches/*.patch` on a new llvm-project branch
 `e0358-assign-2` and `patches/stablehlo/*.patch` on a stablehlo branch of the
 same name, builds LLVM/MLIR (Release with assertions, LLD, MLIR, X86 and NVPTX,
-and the MLIR CUDA runner when `nvcc` is found), stablehlo and cuda-tile, and
-writes `$E0358_ROOT/e0358-env.sh` with the paths the backend reads. Rerunning
+and the MLIR CUDA runner when `nvcc` is found), stablehlo, cuda-tile, and
+`tools/e0358-tile` (against the MLIR and cuda-tile builds), and writes `$E0358_ROOT/e0358-env.sh` with the paths the backend reads. Rerunning
 it keeps existing branches instead of reapplying the patches.
 
 Optional environment for `setup.sh`: `E0358_ROOT`, `E0358_JOBS` (compile
@@ -104,8 +104,8 @@ UV_CACHE_DIR=/tmp/uv-cache-$USER UV_LINK_MODE=copy uv sync
 source ~/llvm/e0358-env.sh
 ```
 
-This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB`, `E0358_STABLEHLO_BIN` and
-`E0358_CUDA_TILE_BIN`. Depending on the machine, also set:
+This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB` and `E0358_STABLEHLO_BIN`.
+Depending on the machine, also set:
 
 - `LD_LIBRARY_PATH`: uv's own Python keeps `libpython3.12.so` in its install
   directory, where torch-xla's `_XLAC` extension does not find it
@@ -144,18 +144,13 @@ utilities; `common.py` is the Asst-2 harness.
 
 ### CUDA Tile bytecode version
 
-cuda-tile v13.4.3 writes bytecode version 13.4 by default, which `tileiras`
+cuda-tile v13.4.3 can write bytecode up to version 13.4, which `tileiras`
 from an older CUDA Toolkit rejects with a misleading
 `error: invalid GPU architecture: 89` (for every target, not just `sm_89`).
-The bytecode version must not be newer than the CUDA Toolkit's, so with CUDA
-13.2 on the RTX 4090 machine the bytecode has to be written as 13.2 (or
-13.1):
-
-```sh
-cuda-tile-translate --mlir-to-cudatilebc --bytecode-version=13.2 \
-  kernel.mlir -o kernel.tilebc
-tileiras --gpu-name sm_89 kernel.tilebc -o kernel.cubin
-```
+The bytecode version must not be newer than the CUDA Toolkit's (13.2 on the
+RTX 4090 machine). `e0358-tile` writes version 13.1, cuda-tile's default for
+its bytecode writer, which any CUDA 13 `tileiras` accepts; with
+`cuda-tile-translate`, pass `--bytecode-version=13.2` or lower.
 
 ## AI-assisted parts
 

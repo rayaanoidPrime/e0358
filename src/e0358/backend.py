@@ -16,8 +16,6 @@ STABLEHLO_BIN = Path(os.environ["E0358_STABLEHLO_BIN"]).expanduser()
 LLVM_BIN = Path(os.environ["E0358_LLVM_BIN"]).expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
 LLVM_LIB = Path(os.environ["E0358_LLVM_LIB"]).expanduser()
-# cuda-tile-translate, for the matmul kernels
-CUDA_TILE_BIN = Path(os.environ.get("E0358_CUDA_TILE_BIN", "")).expanduser()
 # compiler driver used to link the kernel object into a shared library; the
 # cpu path needs clang (its -fopenmp provides the __kmpc_* runtime)
 CC = os.environ.get("E0358_CC", "clang")
@@ -358,25 +356,10 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
 
 
 def compile_tile(chip):
-    """Compiles the matmuls of artifacts/bnc.loops.mlir to CUDA Tile IR
-    kernels, siblings fused when E0358_SIBLING_FUSION=1, and returns run()."""
-    fusion = os.environ.get("E0358_SIBLING_FUSION", "0") == "1"
-    subprocess.run(
-        [
-            LLVM_BIN / "mlir-translate",
-            "--affine-to-cuda-tile",
-            *(["--cuda-tile-sibling-fusion"] if fusion else []),
-            "artifacts/bnc.loops.mlir",
-            "-o",
-            "artifacts/bnc.tile.mlir",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    mlir = Path("artifacts/bnc.tile.mlir")
-    print(mlir.read_text(), "\n...")
-    work = Path(tempfile.mkdtemp(prefix="e0358-"))
-    return tile.Kernels(
-        tile.compile_kernels(mlir, work, CUDA_TILE_BIN, chip), mlir
-    )
+    """CUDA Tile IR kernels for the matmuls of artifacts/bnc.loops.mlir,
+    siblings fused when E0358_SIBLING_FUSION=1."""
+    fusion = os.environ.get("E0358_SIBLING_FUSION") == "1"
+    kernels, ir = tile.compile("artifacts/bnc.loops.mlir", chip, fusion)
+    Path("artifacts/bnc.tile.mlir").write_text(ir)
+    print(ir, "\n...")
+    return kernels

@@ -6,6 +6,7 @@
 #     with patches/stablehlo/*.patch (tablegen rename fix),
 #     built against the llvm above
 #   - cuda-tile at tag v13.4.3, built against the llvm above
+#   - tools/e0358-tile, built against both
 # and writes $ROOT/e0358-env.sh with the environment the backend reads.
 #
 # Usage: ./setup.sh [PATCH...]
@@ -200,19 +201,24 @@ cmake -S . -B build "${CMAKE_COMMON[@]}" \
   -DCUDA_TILE_USE_LLVM_INSTALL_DIR="$LLVM_BUILD"
 ninja -C build -j "$JOBS"
 
+echo "== e0358-tile"
+cmake -S "$REPO/tools/e0358-tile" -B "$REPO/tools/e0358-tile/build" \
+  "${CMAKE_COMMON[@]}" -DLLVM_ENABLE_LLD="$USE_LLD" \
+  -DMLIR_DIR="$LLVM_BUILD/lib/cmake/mlir" -DCUDA_TILE_DIR="$ROOT/cuda-tile"
+ninja -C "$REPO/tools/e0358-tile/build"
+
 ENV_FILE=$ROOT/e0358-env.sh
 cat > "$ENV_FILE" <<ENV
 # source this before running the e0358 backend
 export E0358_LLVM_BIN=$LLVM_BUILD/bin
 export E0358_LLVM_LIB=$LLVM_BUILD/lib
 export E0358_STABLEHLO_BIN=$ROOT/stablehlo/build/bin
-export E0358_CUDA_TILE_BIN=$ROOT/cuda-tile/build/bin
 ENV
 
 echo "== done"
 "$LLVM_BUILD/bin/mlir-opt" --version | sed -n 2p
 "$ROOT/stablehlo/build/bin/stablehlo-opt" --version | sed -n 2p || true
-ls "$ROOT/cuda-tile/build/bin"
+ls "$REPO/tools/e0358-tile/build/e0358-tile"
 if [ "$E0358_CUDA" = ON ]; then
   ls "$LLVM_BUILD/lib/libmlir_cuda_runtime.so"
 else

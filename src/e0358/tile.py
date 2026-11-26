@@ -1,7 +1,7 @@
 """Compiles and launches the CUDA Tile IR kernels of a matmul function.
 
-mlir-translate --affine-to-cuda-tile turns the function's matmul nests into
-kernels and precedes each with the line it is launched from:
+tools/e0358-tile builds the kernels for the function's matmul nests and
+prints the line each kernel is launched from:
 
   // launch @k0 grid=[8, 1] args=[1, 0, 4]
 
@@ -12,9 +12,12 @@ import ctypes
 import functools
 import re
 import subprocess
+import tempfile
+from pathlib import Path
 
 import torch
 
+TOOL = Path(__file__).parents[2] / "tools/e0358-tile/build/e0358-tile"
 LAUNCH = re.compile(r"// launch @(\w+) grid=\[(\d+), (\d+)\] args=\[(.*)\]")
 
 
@@ -29,19 +32,15 @@ def check(error):
         raise RuntimeError(f"CUDA driver error {error}")
 
 
-def compile_kernels(mlir, work, cuda_tile_bin, chip):
-    """Compiles the CUDA Tile IR file 'mlir' to a cubin in 'work'."""
-    # tileiras rejects bytecode newer than its CUDA toolkit (13.2 here)
-    run = lambda *cmd: subprocess.run(cmd, check=True, capture_output=True)
-    run(
-        cuda_tile_bin / "cuda-tile-translate",
-        "--mlir-to-cudatilebc",
-        "--no-implicit-module",
-        "--bytecode-version=13.2",
-        mlir,
-        "-o",
-        work / "kernels.tilebc",
-    )
+def compile(affine, chip, fusion):
+    """Compiles the matmuls of the affine file 'affine' for 'chip', siblings
+    fused if 'fusion'; returns the kernels and their CUDA Tile IR."""
+    work = Path(tempfile.mkdtemp(prefix="e0358-"))
+    run = lambda *cmd: subprocess.run(
+        cmd, check=True, capture_output=True, text=True
+    ).stdout
+    fuse = ["--sibling-fusion"] if fusion else []
+    ir = run(TOOL, *fuse, affine, "-o", work / "kernels.tilebc")
     run(
         "tileiras",
         f"--gpu-name={chip}",
@@ -49,21 +48,18 @@ def compile_kernels(mlir, work, cuda_tile_bin, chip):
         "-o",
         work / "kernels.cubin",
     )
-    return work / "kernels.cubin"
+    return Kernels(work / "kernels.cubin", ir), ir
 
 
 class Kernels:
     """The kernels of a cubin, launched in the order of their launch lines."""
 
-    def __init__(self, cubin, mlir):
+    def __init__(self, cubin, ir):
         self.module = ctypes.c_void_p()
-        check(
-            driver().cuModuleLoadData(
-                ctypes.byref(self.module), cubin.read_bytes()
-            )
-        )
+        module = ctypes.byref(self.module)
+        check(driver().cuModuleLoadData(module, cubin.read_bytes()))
         self.launches = []
-        for name, x, y, args in LAUNCH.findall(mlir.read_text()):
+        for name, x, y, args in LAUNCH.findall(ir):
             kernel = ctypes.c_void_p()
             check(
                 driver().cuModuleGetFunction(
@@ -78,7 +74,7 @@ class Kernels:
         stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
         for kernel, grid, args in self.launches:
             pointers = [ctypes.c_uint64(buffers[a].data_ptr()) for a in args]
-            params = (ctypes.c_void_p * len(pointers))(
+            params = (ctypes.c_void_p * len(args))(
                 *map(ctypes.addressof, pointers)
             )
             # cuda tile kernels take the tile grid and a (1, 1, 1) block
