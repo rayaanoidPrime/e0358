@@ -14,6 +14,9 @@ STABLEHLO_BIN = Path(os.environ["E0358_STABLEHLO_BIN"]).expanduser()
 LLVM_BIN = Path(os.environ["E0358_LLVM_BIN"]).expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
 LLVM_LIB = Path(os.environ["E0358_LLVM_LIB"]).expanduser()
+# compiler driver used to link the kernel object into a shared library; the
+# cpu path needs clang (its -fopenmp provides the __kmpc_* runtime)
+CC = os.environ.get("E0358_CC", "clang")
 
 # threads per GPU block after coalescing each loop nest to one dimension
 GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "256")
@@ -314,7 +317,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
 
     # link to shared object file and load
     subprocess.run(
-        ["clang", "-shared", work / "m.o", *link_flags, "-o", work / "m.so"],
+        [CC, "-shared", work / "m.o", *link_flags, "-o", work / "m.so"],
         check=True,
         capture_output=True,
         text=True,

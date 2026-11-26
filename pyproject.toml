@@ -5,8 +5,8 @@ description = "E0358 compiler course assignments"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "torch==2.8.0",
-    "torch-xla==2.8.0",
+    "torch==2.9.0",
+    "torch-xla==2.9.0",
 ]
 
 [project.scripts]
