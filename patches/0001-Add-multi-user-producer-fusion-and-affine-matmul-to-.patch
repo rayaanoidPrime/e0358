@@ -1,0 +1,658 @@
+From a529ceec4af9ccae71aef9cb79a402808f1f1fa2 Mon Sep 17 00:00:00 2001
+From: e0358 <e0358@localhost>
+Date: Fri, 30 Oct 2026 10:09:49 +0000
+Subject: [PATCH] Add multi-user producer fusion and affine matmul to CUDA Tile
+ IR translation
+
+Affine loop fusion: profitable multi-user producer fusion (Asst-1).
+
+mlir-translate --affine-to-cuda-tile translates a function of affine matmul
+nests, c[i, j] += a[i, k] * b[k, j] with c zero-filled first, into a CUDA
+Tile IR module with one kernel per group of matmuls; each kernel block
+computes one tile of c, accumulating over k in f32. With
+--cuda-tile-sibling-fusion, matmuls that read the same a (same shapes, and
+none writing what another reads) share one kernel, which loads each tile of
+a once for all of them.
+---
+ mlir/include/mlir/InitAllTranslations.h       |   2 +
+ .../Dialect/Affine/Transforms/LoopFusion.cpp  | 189 +++++++---
+ mlir/lib/Target/CMakeLists.txt                |   1 +
+ mlir/lib/Target/CudaTile/AffineToCudaTile.cpp | 332 ++++++++++++++++++
+ mlir/lib/Target/CudaTile/CMakeLists.txt       |  11 +
+ 5 files changed, 493 insertions(+), 42 deletions(-)
+ create mode 100644 mlir/lib/Target/CudaTile/AffineToCudaTile.cpp
+ create mode 100644 mlir/lib/Target/CudaTile/CMakeLists.txt
+
+diff --git a/mlir/include/mlir/InitAllTranslations.h b/mlir/include/mlir/InitAllTranslations.h
+index 622024db5a8a..e7710396c152 100644
+--- a/mlir/include/mlir/InitAllTranslations.h
++++ b/mlir/include/mlir/InitAllTranslations.h
+@@ -22,6 +22,7 @@ void registerFromLLVMIRTranslation();
+ void registerFromSPIRVTranslation();
+ void registerFromWasmTranslation();
+ void registerToCppTranslation();
++void registerToCudaTileTranslation();
+ void registerToLLVMIRTranslation();
+ void registerToSPIRVTranslation();
+ 
+@@ -39,6 +40,7 @@ inline void registerAllTranslations() {
+     registerIRDLToCppTranslation();
+     registerFromWasmTranslation();
+     registerToCppTranslation();
++    registerToCudaTileTranslation();
+     registerToLLVMIRTranslation();
+     registerToSPIRVTranslation();
+     smt::registerExportSMTLIBTranslation();
+diff --git a/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp b/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
+index 77eda4062ec0..b8849aef9476 100644
+--- a/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
++++ b/mlir/lib/Dialect/Affine/Transforms/LoopFusion.cpp
+@@ -788,6 +788,11 @@ public:
+   // The amount of additional computation that is tolerated while fusing
+   // pair-wise as a fraction of the total computation.
+   double computeToleranceThreshold;
++  // Keep multi-user producers alive until their last consumer is fused.
++  bool replicateMultiUserProducers = false;
++  // Defer single-user producers that feed a multi-user producer.
++  bool deferIntoMultiUserProducers = false;
++  DenseSet<unsigned> unprofitableMultiUserProducers;
+ 
+   using Node = MemRefDependenceGraph::Node;
+ 
+@@ -816,8 +821,17 @@ public:
+ 
+   /// Run only producer/consumer fusion on the `mdg`.
+   void runProducerConsumerFusionOnly() {
++    // Stabilize single-user chains first without running the multi-user
++    // preflight or caching its (possibly temporary) failures.
++    deferIntoMultiUserProducers = !maximalFusion;
++    unprofitableMultiUserProducers.clear();
++    fuseProducerConsumerNodes(/*maxSrcUserCount=*/1);
++
++    replicateMultiUserProducers = !maximalFusion;
+     fuseProducerConsumerNodes(
+         /*maxSrcUserCount=*/std::numeric_limits<unsigned>::max());
++    replicateMultiUserProducers = false;
++    deferIntoMultiUserProducers = false;
+     eraseUnusedMemRefAllocations();
+   }
+ 
+@@ -874,6 +888,113 @@ public:
+     return true;
+   }
+ 
++  /// Computes fusion slices for `srcForOp` into `dstNode` at every legal
++  /// depth and returns the deepest legal depth (0 if fusion is illegal).
++  unsigned computeFusionSlices(AffineForOp srcForOp, Node *dstNode,
++                               const DenseSet<Value> &memrefs,
++                               SmallVectorImpl<ComputationSliceState> &slices) {
++    auto dstForOp = cast<AffineForOp>(dstNode->op);
++    SmallVector<AffineForOp, 4> surroundingLoops;
++    getAffineForIVs(*dstForOp, &surroundingLoops);
++    SmallVector<Operation *, 2> dstMemrefOps;
++    for (Operation *op : dstNode->loads)
++      if (memrefs.count(cast<AffineReadOpInterface>(op).getMemRef()))
++        dstMemrefOps.push_back(op);
++    for (Operation *op : dstNode->stores)
++      if (memrefs.count(cast<AffineWriteOpInterface>(op).getMemRef()))
++        dstMemrefOps.push_back(op);
++    if (dstMemrefOps.empty())
++      return 0;
++    unsigned maxDepth =
++        getInnermostCommonLoopDepth(dstMemrefOps) - surroundingLoops.size();
++    slices.resize(maxDepth);
++    unsigned maxLegalDepth = 0;
++    FusionStrategy strategy(FusionStrategy::ProducerConsumer);
++    for (unsigned depth = 1; depth <= maxDepth; ++depth) {
++      FusionResult result = affine::canFuseLoops(
++          srcForOp, dstForOp, depth + surroundingLoops.size(),
++          &slices[depth - 1], strategy);
++      if (result.value == FusionResult::Success)
++        maxLegalDepth = depth;
++    }
++    return maxLegalDepth;
++  }
++
++  DenseSet<unsigned> getAffineConsumers(unsigned producerId,
++                                        const DenseSet<Value> &memrefs) {
++    DenseSet<unsigned> consumers;
++    if (any_of(mdg->nodes, [&](const auto &idAndNode) {
++          return idAndNode.first != producerId &&
++                 any_of(memrefs, [&](Value memref) {
++                   return idAndNode.second.getStoreOpCount(memref) > 0;
++                 });
++        }))
++      return consumers;
++    for (const auto &edge : mdg->outEdges.lookup(producerId))
++      if (memrefs.count(edge.value) > 0 &&
++          mdg->getNode(edge.id)->getLoadOpCount(edge.value) > 0)
++        consumers.insert(edge.id);
++    return consumers;
++  }
++
++  bool isMultiUserFusionProfitable(unsigned srcId,
++                                   const DenseSet<unsigned> &consumers) {
++    Node *srcNode = mdg->getNode(srcId);
++    auto srcForOp = cast<AffineForOp>(srcNode->op);
++    LoopNestStats srcStats;
++    if (!getLoopNestStats(srcForOp, &srcStats))
++      return false;
++
++    bool hasCompute = false;
++    srcForOp.walk([&](Operation *op) {
++      hasCompute |= !isa<AffineForOp, AffineReadOpInterface,
++                         AffineWriteOpInterface, AffineYieldOp>(op);
++    });
++    double originalCost = getComputeCost(srcForOp, srcStats);
++    double fusedCost = 0;
++    double threshold =
++        hasCyclicDependence(srcForOp) ? 0 : computeToleranceThreshold;
++
++    for (unsigned dstId : consumers) {
++      Node *dstNode = mdg->getNode(dstId);
++      if (!isa<AffineForOp>(dstNode->op) || dstNode->op->getNumResults() > 0)
++        return false;
++      auto dstForOp = cast<AffineForOp>(dstNode->op);
++
++      LDBG() << "Multi-user consumer " << dstId << ":\n" << *dstNode->op;
++      DenseSet<Value> memrefs;
++      gatherProducerConsumerMemrefs(srcId, dstId, *mdg, memrefs);
++      SmallVector<ComputationSliceState, 8> slices;
++      unsigned maxLegalDepth =
++          computeFusionSlices(srcForOp, dstNode, memrefs, slices);
++      if (memrefs.empty() || maxLegalDepth == 0)
++        return false;
++
++      SmallVector<Operation *, 2> producerStores;
++      for (Operation *op : srcNode->stores)
++        if (memrefs.count(cast<AffineWriteOpInterface>(op).getMemRef()))
++          producerStores.push_back(op);
++      unsigned bestDepth = maxLegalDepth;
++      if (producerStores.empty() ||
++          !isFusionProfitable(srcForOp, producerStores, dstForOp, slices,
++                              maxLegalDepth, &bestDepth, threshold))
++        return false;
++
++      LoopNestStats dstStats;
++      int64_t pairFusedCost;
++      if (!getLoopNestStats(dstForOp, &dstStats) ||
++          !getFusionComputeCost(srcForOp, srcStats, dstForOp, dstStats,
++                                slices[bestDepth - 1], &pairFusedCost))
++        return false;
++      originalCost += getComputeCost(dstForOp, dstStats);
++      fusedCost += pairFusedCost;
++    }
++
++    double additionalCompute = hasCompute ? fusedCost / originalCost - 1 : 0;
++    LDBG() << "Multi-user additional compute fraction: " << additionalCompute;
++    return additionalCompute <= threshold;
++  }
++
+   /// Perform fusions with node `dstId` as the destination of fusion, with
+   /// No fusion is performed when producers with a user count greater than
+   /// `maxSrcUserCount` for any of the memrefs involved.
+@@ -918,6 +1039,9 @@ public:
+         // Get 'srcNode' from which to attempt fusion into 'dstNode'.
+         auto *srcNode = mdg->getNode(srcId);
+         auto srcAffineForOp = cast<AffineForOp>(srcNode->op);
++        if (replicateMultiUserProducers &&
++            unprofitableMultiUserProducers.count(srcId))
++          continue;
+ 
+         LDBG() << "Trying to fuse producer loop nest " << srcId
+                << " with consumer loop nest " << dstId;
+@@ -937,6 +1061,24 @@ public:
+         gatherProducerConsumerMemrefs(srcId, dstId, *mdg,
+                                       producerConsumerMemrefs);
+ 
++        DenseSet<unsigned> consumers =
++            getAffineConsumers(srcId, producerConsumerMemrefs);
++        bool hasMultipleConsumers = consumers.size() > 1;
++
++        if (deferIntoMultiUserProducers && !hasMultipleConsumers) {
++          DenseSet<Value> dstStores;
++          for (Operation *op : dstNode->stores)
++            dstStores.insert(cast<AffineWriteOpInterface>(op).getMemRef());
++          if (getAffineConsumers(dstId, dstStores).size() > 1)
++            continue;
++        }
++
++        if (replicateMultiUserProducers && hasMultipleConsumers &&
++            !isMultiUserFusionProfitable(srcId, consumers)) {
++          unprofitableMultiUserProducers.insert(srcId);
++          continue;
++        }
++
+         // Skip if 'srcNode' out edge count on any memref is greater than
+         // 'maxSrcUserCount'.
+         if (any_of(producerConsumerMemrefs, [&](Value memref) {
+@@ -958,49 +1100,9 @@ public:
+         if (fusedLoopInsPoint == nullptr)
+           continue;
+ 
+-        // It's possible this fusion is at an inner depth (i.e., there are
+-        // common surrounding affine loops for the source and destination for
+-        // ops). We need to get this number because the call to canFuseLoops
+-        // needs to be passed the absolute depth. The max legal depth and the
+-        // depths we try below are however *relative* and as such don't include
+-        // the common depth.
+-        SmallVector<AffineForOp, 4> surroundingLoops;
+-        getAffineForIVs(*dstAffineForOp, &surroundingLoops);
+-        unsigned numSurroundingLoops = surroundingLoops.size();
+-
+-        // Compute the innermost common loop depth for dstNode
+-        // producer-consumer loads/stores.
+-        SmallVector<Operation *, 2> dstMemrefOps;
+-        for (Operation *op : dstNode->loads)
+-          if (producerConsumerMemrefs.count(
+-                  cast<AffineReadOpInterface>(op).getMemRef()) > 0)
+-            dstMemrefOps.push_back(op);
+-        for (Operation *op : dstNode->stores)
+-          if (producerConsumerMemrefs.count(
+-                  cast<AffineWriteOpInterface>(op).getMemRef()))
+-            dstMemrefOps.push_back(op);
+-        if (dstMemrefOps.empty())
+-          continue;
+-        unsigned dstLoopDepthTest =
+-            getInnermostCommonLoopDepth(dstMemrefOps) - numSurroundingLoops;
+-
+-        // Check the feasibility of fusing src loop nest into dst loop nest
+-        // at loop depths in range [1, dstLoopDepthTest].
+-        unsigned maxLegalFusionDepth = 0;
+         SmallVector<ComputationSliceState, 8> depthSliceUnions;
+-        depthSliceUnions.resize(dstLoopDepthTest);
+-        FusionStrategy strategy(FusionStrategy::ProducerConsumer);
+-        for (unsigned i = 1; i <= dstLoopDepthTest; ++i) {
+-          FusionResult result =
+-              affine::canFuseLoops(srcAffineForOp, dstAffineForOp,
+-                                   /*dstLoopDepth=*/i + numSurroundingLoops,
+-                                   &depthSliceUnions[i - 1], strategy);
+-          if (result.value == FusionResult::Success) {
+-            maxLegalFusionDepth = i;
+-            LDBG() << "Found valid slice for depth: " << i;
+-          }
+-        }
+-
++        unsigned maxLegalFusionDepth = computeFusionSlices(
++            srcAffineForOp, dstNode, producerConsumerMemrefs, depthSliceUnions);
+         if (maxLegalFusionDepth == 0) {
+           LDBG() << "Can't fuse: fusion is not legal at any depth";
+           continue;
+@@ -1075,6 +1177,9 @@ public:
+             srcId, dstId, bestSlice, fusedLoopInsPoint, srcEscapingMemRefs,
+             *mdg);
+ 
++        if (replicateMultiUserProducers && hasMultipleConsumers)
++          removeSrcNode = false;
++
+         DenseSet<Value> privateMemrefs;
+         for (Value memref : producerConsumerMemrefs) {
+           if (canCreatePrivateMemRef(memref, srcEscapingMemRefs, srcId, dstId,
+diff --git a/mlir/lib/Target/CMakeLists.txt b/mlir/lib/Target/CMakeLists.txt
+index f0c3ac4d511c..7920a2e264d5 100644
+--- a/mlir/lib/Target/CMakeLists.txt
++++ b/mlir/lib/Target/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ add_subdirectory(Cpp)
++add_subdirectory(CudaTile)
+ add_subdirectory(IRDLToCpp)
+ add_subdirectory(SPIRV)
+ add_subdirectory(LLVMIR)
+diff --git a/mlir/lib/Target/CudaTile/AffineToCudaTile.cpp b/mlir/lib/Target/CudaTile/AffineToCudaTile.cpp
+new file mode 100644
+index 000000000000..5118395c2ed1
+--- /dev/null
++++ b/mlir/lib/Target/CudaTile/AffineToCudaTile.cpp
+@@ -0,0 +1,332 @@
++//===- AffineToCudaTile.cpp - Affine matmul nests to CUDA Tile IR ---------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Translates a function made of affine matmul nests,
++//
++//   for i, j: c[i, j] = 0
++//   for i, j, k: c[i, j] += a[i, k] * b[k, j]
++//
++// into a CUDA Tile IR module with one kernel per group of matmuls. Each kernel
++// block computes one tile of c, accumulating over k in f32.
++//
++// With sibling fusion, matmuls that read the same a (same shapes, and no
++// matmul writing what another reads) form one group: its kernel loads each
++// tile of a once and multiplies it with the tiles of every b.
++//
++// Each kernel is preceded by the line the runtime launches it from:
++//
++//   // launch @k0 grid=[8, 1] args=[1, 0, 4]
++//
++// args are the function argument numbers, in kernel parameter order.
++//
++//===----------------------------------------------------------------------===//
++
++#include "mlir/Dialect/Affine/IR/AffineOps.h"
++#include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
++#include "mlir/Dialect/MemRef/IR/MemRef.h"
++#include "mlir/IR/BuiltinOps.h"
++#include "mlir/IR/Matchers.h"
++#include "mlir/Tools/mlir-translate/Translation.h"
++#include "llvm/Support/CommandLine.h"
++#include "llvm/Support/FormatVariadic.h"
++
++using namespace mlir;
++using namespace mlir::affine;
++using llvm::formatv;
++
++namespace {
++/// c[m x n] += a[m x k] * b[k x n], on function arguments.
++struct Matmul {
++  BlockArgument a, b, c;
++  int64_t m, n, k;
++};
++} // namespace
++
++/// Returns the loops of the perfect nest rooted at `loop`, outermost first.
++static SmallVector<AffineForOp> perfectNest(AffineForOp loop) {
++  SmallVector<AffineForOp> nest = {loop};
++  while (llvm::hasSingleElement(nest.back().getBody()->without_terminator()))
++    if (auto inner = dyn_cast<AffineForOp>(nest.back().getBody()->front()))
++      nest.push_back(inner);
++    else
++      break;
++  return nest;
++}
++
++/// Returns the trip count of a loop from 0 with step 1, or 0 for other loops.
++static int64_t tripCount(AffineForOp loop) {
++  if (!loop.hasConstantBounds() || loop.getConstantLowerBound() != 0 ||
++      loop.getStepAsInt() != 1)
++    return 0;
++  return loop.getConstantUpperBound();
++}
++
++/// Returns the function argument that `op` accesses at exactly `ivs`.
++template <typename OpTy>
++static BlockArgument accessAt(OpTy op, ArrayRef<Value> ivs) {
++  if (!op || !op.getAffineMap().isIdentity() ||
++      !llvm::equal(op.getMapOperands(), ivs))
++    return nullptr;
++  auto arg = dyn_cast<BlockArgument>(op.getMemRef());
++  auto type = cast<MemRefType>(op.getMemRef().getType());
++  return arg && type.getLayout().isIdentity() ? arg : nullptr;
++}
++
++/// Matches `for i, j: c[i, j] = 0` and returns c.
++static BlockArgument matchZeroFill(AffineForOp loop) {
++  SmallVector<AffineForOp> nest = perfectNest(loop);
++  if (nest.size() != 2 || !tripCount(nest[0]) || !tripCount(nest[1]))
++    return nullptr;
++  auto store = dyn_cast<AffineStoreOp>(nest[1].getBody()->front());
++  if (!store || !matchPattern(store.getValue(), m_AnyZeroFloat()))
++    return nullptr;
++  return accessAt(store,
++                  {nest[0].getInductionVar(), nest[1].getInductionVar()});
++}
++
++/// Matches `for i, j, k: c[i, j] += a[i, k] * b[k, j]`.
++static std::optional<Matmul> matchMatmul(AffineForOp loop) {
++  SmallVector<AffineForOp> nest = perfectNest(loop);
++  if (nest.size() != 3)
++    return std::nullopt;
++  Value i = nest[0].getInductionVar(), j = nest[1].getInductionVar(),
++        k = nest[2].getInductionVar();
++  Block *body = nest[2].getBody();
++  auto store = dyn_cast<AffineStoreOp>(body->back().getPrevNode());
++  auto add = store ? store.getValue().getDefiningOp<arith::AddFOp>() : nullptr;
++  if (!add || body->getOperations().size() != 7)
++    return std::nullopt;
++  // c[i, j] + a * b, in either order.
++  Value acc = add.getLhs(), product = add.getRhs();
++  if (!product.getDefiningOp<arith::MulFOp>())
++    std::swap(acc, product);
++  auto mul = product.getDefiningOp<arith::MulFOp>();
++  if (!mul)
++    return std::nullopt;
++  Matmul mm{accessAt(mul.getLhs().getDefiningOp<AffineLoadOp>(), {i, k}),
++            accessAt(mul.getRhs().getDefiningOp<AffineLoadOp>(), {k, j}),
++            accessAt(store, {i, j}),
++            tripCount(nest[0]),
++            tripCount(nest[1]),
++            tripCount(nest[2])};
++  if (!mm.a || !mm.b || !mm.c || !mm.m || !mm.n || !mm.k ||
++      accessAt(acc.getDefiningOp<AffineLoadOp>(), {i, j}) != mm.c)
++    return std::nullopt;
++  return mm;
++}
++
++/// Whether `x` and `y` can share one kernel: the same a and shapes, and
++/// neither writes what the other reads.
++static bool fusable(const Matmul &x, const Matmul &y) {
++  return x.a == y.a && x.m == y.m && x.n == y.n && x.k == y.k &&
++         !llvm::is_contained({y.a, y.b}, x.c) &&
++         !llvm::is_contained({x.a, x.b}, y.c);
++}
++
++/// Tile sizes (m x n x k) for a group of `count` matmuls of `mm`'s shape,
++/// picked from measurements on an RTX 4090: 16-deep k tiles, enough blocks
++/// for its 128 SMs where the matrix allows it, and, in fused groups, where
++/// each matmul keeps its own accumulator, narrower tiles.
++static std::array<int64_t, 3> tileSizes(const Matmul &mm, size_t count) {
++  const int64_t numSMs = 128;
++  bool f32 = cast<MemRefType>(mm.a.getType()).getElementType().isF32();
++  auto blocks = [&](int64_t tm, int64_t tn) {
++    return (mm.m / tm) * (mm.n / tn);
++  };
++  int64_t tm = f32 && count == 1 ? 32 : 64;
++  if (blocks(tm, 32) < numSMs)
++    tm = 32;
++  int64_t tn = count == 1 ? 128 : f32 ? 32 : 64;
++  while (tn > 32 && (mm.n % tn || blocks(tm, tn) < numSMs))
++    tn /= 2;
++  return {tm, tn, 16};
++}
++
++/// Prints the kernel computing `group` as @k<id>, with tiles of `tm x tn` of
++/// c and `tk`-deep steps over k.
++static void printKernel(ArrayRef<Matmul> group, int id, int64_t tm, int64_t tn,
++                        int64_t tk, raw_ostream &os) {
++  const Matmul &mm = group.front();
++  std::string t;
++  llvm::raw_string_ostream(t)
++      << cast<MemRefType>(mm.a.getType()).getElementType();
++
++  // The tile types, and the types of a row-major matrix cut into tiles.
++  auto tile = [](int64_t rows, int64_t cols, StringRef type) {
++    return formatv("tile<{0}x{1}x{2}>", rows, cols, type).str();
++  };
++  auto tiles = [&](int64_t rows, int64_t cols, int64_t tr, int64_t tc) {
++    return formatv("partition_view<tile=({0}x{1}), tensor_view<{2}x{3}x{4}, "
++                   "strides=[{3},1]>>",
++                   tr, tc, rows, cols, t)
++        .str();
++  };
++  std::string aTile = tile(tm, tk, t), bTile = tile(tk, tn, t),
++              cTile = tile(tm, tn, t), acc = tile(tm, tn, "f32"),
++              aTiles = tiles(mm.m, mm.k, tm, tk),
++              bTiles = tiles(mm.k, mm.n, tk, tn),
++              cTiles = tiles(mm.m, mm.n, tm, tn);
++
++  // Joins `line(n)` over the matmuls n of the group.
++  auto each = [&](auto line, StringRef separator = "") {
++    SmallVector<std::string> lines;
++    for (size_t n = 0; n < group.size(); ++n)
++      lines.push_back(line(n));
++    return llvm::join(lines, separator);
++  };
++  // Defines %<name>_tiles, the matrix at %<name> cut into `type` tiles.
++  auto partition = [&](const Twine &name, int64_t rows, int64_t cols,
++                       StringRef type) {
++    return formatv("    %{0}_view = make_tensor_view %{0}, shape = [{1}, {2}], "
++                   "strides = [{2}, 1] : tensor_view<{1}x{2}x{3}, "
++                   "strides=[{2},1]>\n"
++                   "    %{0}_tiles = make_partition_view %{0}_view : {4}\n",
++                   name.str(), rows, cols, t, type)
++        .str();
++  };
++
++  os << formatv("  // launch @k{0} grid=[{1}, {2}] args=[{3}{4}]\n", id,
++                mm.m / tm, mm.n / tn, mm.a.getArgNumber(), each([&](size_t n) {
++                  return formatv(", {0}, {1}", group[n].b.getArgNumber(),
++                                 group[n].c.getArgNumber())
++                      .str();
++                }));
++  os << formatv("  entry @k{0}(%a: tile<ptr<{1}>>{2}) {{\n", id, t,
++                each([&](size_t n) {
++                  return formatv(", %b{0}: tile<ptr<{1}>>, %c{0}: "
++                                 "tile<ptr<{1}>>",
++                                 n, t)
++                      .str();
++                }));
++  os << "    %i, %j, %unused = get_tile_block_id : tile<i32>\n";
++  os << partition("a", mm.m, mm.k, aTiles) << each([&](size_t n) {
++    return partition("b" + Twine(n), mm.k, mm.n, bTiles) +
++           partition("c" + Twine(n), mm.m, mm.n, cTiles);
++  });
++
++  // for k: acc_n += a[i, k] * b_n[k, j], one f32 accumulator per matmul.
++  os << formatv("    %zero = constant <f32: 0.0> : {0}\n"
++                "    %k0 = constant <i32: 0> : tile<i32>\n"
++                "    %k1 = constant <i32: 1> : tile<i32>\n"
++                "    %kn = constant <i32: {1}> : tile<i32>\n",
++                acc, mm.k / tk);
++  os << formatv(
++      "    %acc:{0} = for %k in (%k0 to %kn, step %k1) : tile<i32> "
++      "iter_values({1}) -> ({2}) {{\n",
++      group.size(),
++      each([](size_t n) { return formatv("%acc{0} = %zero", n).str(); }, ", "),
++      each([&](size_t) { return acc; }, ", "));
++  os << formatv("      %x, %tx = load_view_tko weak %a_tiles[%i, %k] : {0}, "
++                "tile<i32> -> {1}, token\n",
++                aTiles, aTile);
++  os << each([&](size_t n) {
++    return formatv("      %w{0}, %tw{0} = load_view_tko weak %b{0}_tiles[%k, "
++                   "%j] : {1}, tile<i32> -> {2}, token\n"
++                   "      %sum{0} = mmaf %x, %w{0}, %acc{0} : {3}, {2}, {4}\n",
++                   n, bTiles, bTile, aTile, acc)
++        .str();
++  });
++  os << formatv(
++      "      continue {0} : {1}\n    }\n",
++      each([](size_t n) { return formatv("%sum{0}", n).str(); }, ", "),
++      each([&](size_t) { return acc; }, ", "));
++
++  // c_n[i, j] = acc_n, in the element type.
++  os << each([&](size_t n) {
++    std::string convert, result = formatv("%acc#{0}", n);
++    if (t != "f32") {
++      convert = formatv("    %c{0}_tile = ftof %acc#{0} : {1} -> {2}\n", n, acc,
++                        cTile);
++      result = formatv("%c{0}_tile", n);
++    }
++    return convert + formatv("    %s{0} = store_view_tko weak {1}, "
++                             "%c{0}_tiles[%i, %j] : {2}, {3}, tile<i32> -> "
++                             "token\n",
++                             n, result, cTile, cTiles)
++                         .str();
++  });
++  os << "    return\n  }\n";
++}
++
++static LogicalResult translateToCudaTile(ModuleOp module, raw_ostream &os,
++                                         bool siblingFusion) {
++  auto funcs = module.getOps<func::FuncOp>();
++  if (!llvm::hasSingleElement(funcs))
++    return module.emitError("expected a single function");
++  func::FuncOp func = *funcs.begin();
++
++  // Collect the matmuls and the buffers zeroed before them; anything else in
++  // the function cannot be translated.
++  SmallVector<Matmul> matmuls;
++  DenseSet<Value> zeroed;
++  for (Operation &op : func.getBody().front()) {
++    auto loop = dyn_cast<AffineForOp>(op);
++    if (BlockArgument c = loop ? matchZeroFill(loop) : nullptr) {
++      zeroed.insert(c);
++      continue;
++    }
++    if (std::optional<Matmul> mm = loop ? matchMatmul(loop) : std::nullopt) {
++      if (!zeroed.contains(mm->c))
++        return loop.emitError("matmul output is not zero-initialized");
++      matmuls.push_back(*mm);
++      continue;
++    }
++    if (!isa<arith::ConstantOp, func::ReturnOp>(op))
++      return op.emitError("not a matmul nest");
++  }
++
++  // Group the matmuls into kernels: each alone, or with its siblings.
++  SmallVector<SmallVector<Matmul>> groups;
++  for (const Matmul &mm : matmuls) {
++    auto group = llvm::find_if(groups, [&](ArrayRef<Matmul> g) {
++      return siblingFusion &&
++             llvm::all_of(g, [&](const Matmul &x) { return fusable(x, mm); });
++    });
++    if (group == groups.end())
++      groups.push_back({mm});
++    else
++      group->push_back(mm);
++  }
++
++  // Kernels cover whole tiles only.
++  SmallVector<std::array<int64_t, 3>> tiles;
++  for (ArrayRef<Matmul> group : groups) {
++    const Matmul &mm = group.front();
++    tiles.push_back(tileSizes(mm, group.size()));
++    auto [tm, tn, tk] = tiles.back();
++    if (mm.m % tm || mm.n % tn || mm.k % tk)
++      return func.emitError(formatv("matmul of {0}x{1}x{2} is not made of "
++                                    "{3}x{4}x{5} tiles",
++                                    mm.m, mm.n, mm.k, tm, tn, tk));
++  }
++
++  os << "cuda_tile.module @kernels {\n";
++  for (auto [id, group, tile] : llvm::enumerate(groups, tiles))
++    printKernel(group, id, tile[0], tile[1], tile[2], os);
++  os << "}\n";
++  return success();
++}
++
++namespace mlir {
++void registerToCudaTileTranslation() {
++  static llvm::cl::opt<bool> siblingFusion(
++      "cuda-tile-sibling-fusion",
++      llvm::cl::desc("Fuse matmuls that share their a operand"),
++      llvm::cl::init(false));
++  TranslateFromMLIRRegistration registration(
++      "affine-to-cuda-tile", "translate affine matmul nests to CUDA Tile IR",
++      [](ModuleOp module, raw_ostream &os) {
++        return translateToCudaTile(module, os, siblingFusion);
++      },
++      [](DialectRegistry &registry) {
++        registry.insert<AffineDialect, arith::ArithDialect, func::FuncDialect,
++                        memref::MemRefDialect>();
++      });
++}
++} // namespace mlir
+diff --git a/mlir/lib/Target/CudaTile/CMakeLists.txt b/mlir/lib/Target/CudaTile/CMakeLists.txt
+new file mode 100644
+index 000000000000..c1d44441940f
+--- /dev/null
++++ b/mlir/lib/Target/CudaTile/CMakeLists.txt
+@@ -0,0 +1,11 @@
++add_mlir_translation_library(MLIRTargetCudaTile
++  AffineToCudaTile.cpp
++
++  LINK_LIBS PUBLIC
++  MLIRAffineDialect
++  MLIRArithDialect
++  MLIRFuncDialect
++  MLIRIR
++  MLIRMemRefDialect
++  MLIRTranslateLib
++)
+-- 
+2.43.0
+

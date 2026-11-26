@@ -9,11 +9,15 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import tile
+
 # llvm and stablehlo build locations
 STABLEHLO_BIN = Path(os.environ["E0358_STABLEHLO_BIN"]).expanduser()
 LLVM_BIN = Path(os.environ["E0358_LLVM_BIN"]).expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
 LLVM_LIB = Path(os.environ["E0358_LLVM_LIB"]).expanduser()
+# cuda-tile-translate, for the matmul kernels
+CUDA_TILE_BIN = Path(os.environ.get("E0358_CUDA_TILE_BIN", "")).expanduser()
 # compiler driver used to link the kernel object into a shared library; the
 # cpu path needs clang (its -fopenmp provides the __kmpc_* runtime)
 CC = os.environ.get("E0358_CC", "clang")
@@ -55,31 +59,42 @@ def memref_descriptor(t):
     )
 
 
-def make_callable(lib, meta, device):
-    func = lib._mlir_ciface_main
-    func.restype = None
+def make_callable(run, meta, device):
+    """Returns the compiled function: run(tensors) computes it on the MLIR
+    function's arguments, its inputs followed by its outputs."""
     # MLIR argument k is fed by user input input_locations[k].position
     order = [loc.position for loc in meta.input_locations]
 
     def callable_fn(*args):
-        # outputs are allocated here and passed as out-params; on cuda the
-        # descriptors carry device pointers, which the kernels use directly
+        # outputs are allocated here and passed as out-params
         outs = [
             torch.empty(s.shape, dtype=getattr(torch, s.dtype), device=device)
             for s in meta.output_signature
         ]
         # we pass identity-layout bufferization
         # so we need contiguous row-major tensors
-        tensors = [args[i].contiguous() for i in order] + outs
+        run([args[i].contiguous() for i in order] + outs)
+        return tuple(outs)
+
+    return callable_fn
+
+
+def run_library(lib, device):
+    """run() for the MLIR function compiled into shared library 'lib'."""
+    func = lib._mlir_ciface_main
+    func.restype = None
+
+    def run(tensors):
         if device.type == "cuda":
             # the mlir cuda runtime launches on its own non-blocking stream,
             # so wait for torch's pending work
             # the launch itself synchronizes before returning
             torch.cuda.synchronize(device)
+        # on cuda the descriptors carry device pointers, which the kernels
+        # use directly
         func(*(ctypes.byref(memref_descriptor(t)) for t in tensors))
-        return tuple(outs)
 
-    return callable_fn
+    return run
 
 
 def move_allocs_to_device(path):
@@ -148,7 +163,7 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "-o",
             "artifacts/bnc.linalg.mlir",
         ],
-        # lower linalg to affine dialect and fuse
+        # lower linalg to affine loops
         [
             LLVM_BIN / "mlir-opt",
             "artifacts/bnc.linalg.mlir",
@@ -157,6 +172,14 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--buffer-results-to-out-params="
             "hoist-static-allocs=true modify-public-functions=true",
             "--convert-linalg-to-affine-loops",
+            "--canonicalize",
+            "-o",
+            "artifacts/bnc.loops.mlir",
+        ],
+        # fuse
+        [
+            LLVM_BIN / "mlir-opt",
+            "artifacts/bnc.loops.mlir",
             fusion_pass,
             "--affine-scalrep",
             "-o",
@@ -255,6 +278,14 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         print(result.stderr)
 
     print(Path("artifacts/bnc.affine.mlir").read_text(), "\n...")
+    meta = stablehlo_program._bundle.stablehlo_funcs[0].meta
+
+    if device.type == "cuda":
+        try:
+            return make_callable(compile_tile(chip), meta, device)
+        except subprocess.CalledProcessError as error:
+            # not made of matmuls: take the affine gpu path below
+            print(error.stderr)
 
     if device.type == "cuda":
         move_allocs_to_device("artifacts/bnc.affine.mlir")
@@ -323,6 +354,29 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
         text=True,
     )
     lib = ctypes.CDLL(str(work / "m.so"))
+    return make_callable(run_library(lib, device), meta, device)
 
-    meta = stablehlo_program._bundle.stablehlo_funcs[0].meta
-    return make_callable(lib, meta, device)
+
+def compile_tile(chip):
+    """Compiles the matmuls of artifacts/bnc.loops.mlir to CUDA Tile IR
+    kernels, siblings fused when E0358_SIBLING_FUSION=1, and returns run()."""
+    fusion = os.environ.get("E0358_SIBLING_FUSION", "0") == "1"
+    subprocess.run(
+        [
+            LLVM_BIN / "mlir-translate",
+            "--affine-to-cuda-tile",
+            *(["--cuda-tile-sibling-fusion"] if fusion else []),
+            "artifacts/bnc.loops.mlir",
+            "-o",
+            "artifacts/bnc.tile.mlir",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    mlir = Path("artifacts/bnc.tile.mlir")
+    print(mlir.read_text(), "\n...")
+    work = Path(tempfile.mkdtemp(prefix="e0358-"))
+    return tile.Kernels(
+        tile.compile_kernels(mlir, work, CUDA_TILE_BIN, chip), mlir
+    )
