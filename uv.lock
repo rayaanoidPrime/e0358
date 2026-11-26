@@ -108,7 +108,7 @@ wheels = [
 [[package]]
 name = "e0358"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "tensorrt-cu12" },
     { name = "tensorrt-cu12-bindings" },

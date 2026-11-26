@@ -14,13 +14,6 @@ dependencies = [
     "tensorrt-cu12-libs>=10.13,<10.14",
 ]
 
-[project.scripts]
-e0358 = "e0358:main"
-
-[build-system]
-requires = ["uv_build>=0.13.4,<0.14.0"]
-build-backend = "uv_build"
-
 [dependency-groups]
 dev = [
     "black>=26.10.1",
@@ -47,6 +40,8 @@ url = "https://pypi.nvidia.com"
 explicit = true
 
 [tool.uv]
+# e0358.py is a module, imported from this directory, not an installed package
+package = false
 # Both machines used (laptop and GPU server) are x86_64 Linux.
 environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # torch-tensorrt also requires the generic 'tensorrt' metapackage, which now

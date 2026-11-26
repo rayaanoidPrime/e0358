@@ -159,7 +159,7 @@ its bytecode writer, which any CUDA 13 `tileiras` accepts; with
 
 ### Pipeline
 
-On CUDA, `src/e0358/backend.py` compiles a graph in these steps:
+On CUDA, the backend in `e0358.py` compiles a graph in these steps:
 
 1. `torch.export` and torch-xla export it to StableHLO.
 2. `stablehlo-opt --stablehlo-legalize-to-linalg`, then `mlir-opt` bufferizes
@@ -168,8 +168,8 @@ On CUDA, `src/e0358/backend.py` compiles a graph in these steps:
 3. `tools/e0358-tile` builds CUDA Tile IR kernels for the affine matmuls and
    writes them as bytecode (the IR is printed to `artifacts/bnc.tile.mlir`).
 4. `tileiras` compiles the bytecode to a cubin for the GPU (`sm_89`).
-5. `src/e0358/tile.py` loads the cubin with the CUDA driver API and launches
-   the kernels on torch's current stream.
+5. `Kernels` loads the cubin with the CUDA driver API and launches the
+   kernels on torch's current stream.
 
 Graphs that are not matmuls (the Asst-1 tests) make step 3 fail and take the
 Asst-1 path instead: affine loop fusion (`patches/`), then the GPU dialect.
@@ -280,7 +280,7 @@ AI-assisted.
 
 ### Toolchain setup script and gpu chip override
 
-Files: `setup.sh`, `GPU_CHIP` / `gpu_chip()` in `src/e0358/backend.py`.
+Files: `setup.sh`, `GPU_CHIP` / `gpu_chip()` in `e0358.py`.
 
 Prompt:
 
@@ -324,7 +324,7 @@ Prompt:
 ### GPU server setup and Python environment
 
 Files: `pyproject.toml` and `uv.lock` (torch/torch-xla 2.9.0,
-torch-tensorrt), `E0358_CC` in `src/e0358/backend.py`, `common_asst_1.py`
+torch-tensorrt), `E0358_CC` in `e0358.py`, `common_asst_1.py`
 and the `common` import in the two Asst-1 scripts, and the Versions and Setup
 sections above. The agent also built the toolchain and the Python
 environment on the RTX 4090 server over SSH.
@@ -375,9 +375,9 @@ Prompts, as typed (the server's address and login details are redacted):
 
 ### CUDA Tile IR lowering, sibling fusion, and this README
 
-Files: `tools/e0358-tile/`, `src/e0358/tile.py`, `compile_tile`,
-`make_callable` and `run_library` in `src/e0358/backend.py`, the
-`e0358-tile` build in `setup.sh`, and the Design and Results sections above.
+Files: `tools/e0358-tile/`, `Kernels`, `compile_tile`, `make_callable` and
+`run_library` in `e0358.py`, the `e0358-tile` build in `setup.sh`, and the
+Design and Results sections above.
 The agent reviewed the student's initial plan (first prompt below) and gave
 design input. It wrote the matcher, the fusion decision and the kernel
 builder, and picked the tile sizes from sweeps it ran on the RTX 4090. A
