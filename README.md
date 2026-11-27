@@ -7,7 +7,7 @@
 | llvm-project  | `d6a4b2ad0b90fad43565a25f1cbcbac6e6857dde` (2026-11-03)   |
 | stablehlo     | `b26a2e2a6e91b9144f8dc1aafbee74d01016d558` (2026-11-04)   |
 | cuda-tile     | `v13.4.3`                                                 |
-| Python        | 3.12                                                      |
+| Python        | the system's, 3.10 or newer (3.10.12 on the RTX 4090)     |
 | torch         | 2.9.0 (CUDA 12.8 build)                                   |
 | torch-xla     | 2.9.0                                                     |
 | torch-tensorrt| 2.9.0+cu128 (PyTorch's cu128 index), TensorRT 10.13.3 |
@@ -60,11 +60,15 @@ export PATH=$HOME/.local/bin:/usr/local/cuda/bin:$PATH  # also in ~/.bashrc
 ### 1. Python environment
 
 ```sh
-uv sync   # Python 3.12, torch, torch-xla, torch-tensorrt 2.9.0 into .venv
+uv sync   # torch, torch-xla, torch-tensorrt 2.9.0 into .venv
 ```
 
-The environment takes about 7 GB. On a machine with little space where the
-project lives, put uv's download cache on another disk:
+uv uses the machine's own Python (`python-preference = "only-system"`), 3.10
+or newer, with its development headers: the MLIR and cuda-tile Python
+bindings are built for it, and uv's downloaded Pythons keep `libpython`
+where torch-xla does not find it. The environment takes about 12 GB; on a
+machine with little space where the project lives, put uv's download cache on
+another disk:
 
 ```sh
 UV_CACHE_DIR=/tmp/uv-cache-$USER UV_LINK_MODE=copy uv sync
@@ -110,16 +114,6 @@ This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB`, `E0358_STABLEHLO_BIN` and
 `E0358_CUDA_TILE_BIN`, and puts the MLIR and cuda-tile Python bindings on
 `PYTHONPATH`.
 Depending on the machine, also set:
-
-- `LD_LIBRARY_PATH`: uv's own Python keeps `libpython3.12.so` in its install
-  directory, where torch-xla's `_XLAC` extension does not find it
-  (`ImportError: libpython3.12.so.1.0: cannot open shared object file`). Not
-  needed with a system Python 3.12.
-
-  ```sh
-  export LD_LIBRARY_PATH=$(.venv/bin/python -c \
-    "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))"):$LD_LIBRARY_PATH
-  ```
 
 - `E0358_CC`: the compiler driver that links the compiled kernels into a
   shared library (default `clang`). Set `E0358_CC=gcc` on machines without
@@ -225,8 +219,8 @@ launches `k0`, `k1` and `k2` without fusion, and only `k0` with fusion.
 
 ## Results
 
-Measured on an RTX 4090 (driver 595.58, CUDA 13.2), with no other process on
-the GPU, by:
+Measured on an RTX 4090 (driver 595.58, CUDA 13.2, Python 3.10.12), with no
+other process on the GPU, by:
 
 ```sh
 python qkv-projection.py --backend e0358 --reference eager --device cuda \
@@ -244,35 +238,35 @@ so `mmaf` does not round inputs to TF32.
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.027** / **0.027** | **0.135** / **0.135** | 0.393 / 0.405         |
-| inductor          | 0.058 / 0.064         | **0.135** / 0.136     | 0.393 / 0.406         |
-| tensorrt          | 0.092 / 0.089         | 0.162 / 0.162         | **0.339** / **0.337** |
-| e0358 (no fusion) | 0.171 / 0.172         | 0.593 / 0.597         | 1.243 / 1.250         |
-| e0358 (fusion)    | 0.077 / 0.077         | 0.495 / 0.499         | 0.861 / 0.905         |
+| eager             | **0.026** / **0.027** | **0.135** / **0.136** | 0.397 / 0.393         |
+| inductor          | 0.067 / 0.071         | **0.135** / **0.136** | 0.397 / 0.393         |
+| tensorrt          | 0.095 / 0.102         | 0.163 / 0.162         | **0.340** / **0.343** |
+| e0358 (no fusion) | 0.171 / 0.171         | 0.593 / 0.594         | 1.245 / 1.245         |
+| e0358 (fusion)    | 0.077 / 0.077         | 0.496 / 0.496         | 0.902 / 0.903         |
 
 **float16**
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.026** / **0.026** | **0.063** / **0.063** | **0.097** / **0.098** |
-| inductor          | 0.070 / 0.073         | **0.063** / 0.064     | **0.097** / **0.098** |
-| tensorrt          | 0.103 / 0.106         | 0.110 / 0.113         | 0.116 / 0.117         |
-| e0358 (no fusion) | 0.067 / 0.067         | 0.320 / 0.320         | 0.612 / 0.613         |
-| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.377 / 0.377         |
+| eager             | **0.027** / **0.028** | **0.063** / **0.063** | **0.097** / **0.098** |
+| inductor          | 0.074 / 0.074         | 0.071 / 0.070         | **0.097** / **0.098** |
+| tensorrt          | 0.110 / 0.110         | 0.118 / 0.120         | 0.122 / 0.129         |
+| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.320         | 0.613 / 0.614         |
+| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.377 / 0.378         |
 
 **bfloat16**
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.025** / **0.025** | **0.052** / **0.052** | **0.097** / **0.098** |
-| inductor          | 0.060 / 0.064         | 0.056 / 0.057         | **0.097** / **0.098** |
-| tensorrt          | 0.102 / 0.103         | 0.111 / 0.114         | 0.110 / 0.114         |
-| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.319         | 0.612 / 0.613         |
-| e0358 (fusion)    | 0.038 / 0.039         | 0.239 / 0.240         | 0.376 / 0.381         |
+| eager             | **0.027** / **0.027** | **0.052** / **0.052** | **0.097** / **0.098** |
+| inductor          | 0.072 / 0.079         | 0.066 / 0.071         | **0.097** / **0.098** |
+| tensorrt          | 0.111 / 0.114         | 0.122 / 0.123         | 0.118 / 0.120         |
+| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.320         | 0.613 / 0.613         |
+| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.377 / 0.377         |
 
 The sizes (N x d_model x d) are 512x768x64 for bert-base, 1024x1024x1024 for
-gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 5%
-everywhere except Inductor at bert-base (up to 10%).
+gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 1%
+for e0358 and within 9% for the baselines.
 
 How the variants compare (medians):
 
@@ -283,16 +277,16 @@ How the variants compare (medians):
   There the time is mostly fixed costs (launch, k-loop latency), which fusion
   pays once instead of three times. It is smallest at gpt2-medium, where the
   three 1024x1024 weight matrices, not `x`, dominate memory traffic.
-- **e0358 vs eager and Inductor:** fused e0358 is 1.5x (float16 bert-base)
-  to 4.6x (bfloat16 gpt2-medium) slower than eager. Inductor is slower than
-  eager at bert-base in every dtype and at bfloat16 gpt2-medium, and matches
-  it elsewhere. Eager's matmuls are cuBLAS kernels (nsys shows
-  `ampere_sgemm_*` for float32), hand-tuned for this GPU. Each e0358 kernel
-  is one simple k-loop that leaves scheduling to `tileiras`. It has no
-  split-k, which would help bert-base, whose 512x64 outputs give only 32
-  blocks for 128 SMs. It has no load latency hints, and its tile sizes come
-  from a coarse sweep. In float16 it reaches 27 to 34 TFLOP/s fused, against
-  eager's 102 to 133.
+- **e0358 vs eager and Inductor:** fused e0358 is 1.4x (float16 and
+  bfloat16 bert-base) to 4.6x (bfloat16 gpt2-medium) slower than eager.
+  Inductor is slower than eager at bert-base in every dtype and at
+  gpt2-medium in float16 and bfloat16, and matches it at llama-7b. Eager's
+  matmuls are cuBLAS kernels (nsys shows `ampere_sgemm_*` for float32),
+  hand-tuned for this GPU. Each e0358 kernel is one simple k-loop that leaves
+  scheduling to `tileiras`. It has no split-k, which would help bert-base,
+  whose 512x64 outputs give only 32 blocks for 128 SMs. It has no load
+  latency hints, and its tile sizes come from a coarse sweep. In float16 it
+  reaches 27 to 34 TFLOP/s fused, against eager's 103 to 133.
 - **TensorRT:** it takes about 0.1 ms even at bert-base, which makes it the
   slowest baseline there. In float32 it beats eager only at llama-7b; in
   float16 and bfloat16, never.
@@ -479,6 +473,13 @@ Prompts:
 > i think its worth a shot, first package the files needed for assignment 2
 > submissiont into a separate folder outisde of e0358, in the readme remove
 > everything assignment 1 related
+
+> dont update the submission folder yet wait for my greenlight
+
+> it seems the uv python version 3.12 is causing a lot of problems, any
+> reasons we cant downgrade to 3.10 ?
+
+> yeah do this : let each machine use its own system Python
 
 Short status checks during the builds ("the build still running?",
 "status", "statu", "status?", "update") and one-word confirmations ("yes")
