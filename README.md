@@ -46,8 +46,7 @@ CUDA 13 TensorRT as well.
 - git, CMake >= 3.20, Ninja, a C++17 compiler (clang or gcc), Python 3
 - [uv](https://docs.astral.sh/uv/) for the Python environment
 - for the GPU path: an NVIDIA driver and a CUDA Toolkit 13.x with `nvcc` and
-  `tileiras` (`/usr/local/cuda/bin` is added to `PATH` by `setup.sh` if
-  `nvcc` is not already on it)
+  `tileiras` (`setup.sh` also looks in `/usr/local/cuda/bin`)
 
 Without root (e.g. a shared GPU server), CMake, Ninja and uv can be installed
 into `~/.local/bin` from PyPI:
@@ -111,8 +110,8 @@ source ~/llvm/e0358-env.sh
 ```
 
 This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB`, `E0358_STABLEHLO_BIN` and
-`E0358_CUDA_TILE_BIN`, and puts the MLIR and cuda-tile Python bindings on
-`PYTHONPATH`.
+`E0358_CUDA_TILE_BIN`, puts the MLIR and cuda-tile Python bindings on
+`PYTHONPATH`, and puts the CUDA Toolkit's `bin` (with `tileiras`) on `PATH`.
 Depending on the machine, also set:
 
 - `E0358_CC`: the compiler driver that links the compiled kernels into a

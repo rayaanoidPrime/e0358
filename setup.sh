@@ -223,6 +223,10 @@ export E0358_CUDA_TILE_BIN=$ROOT/cuda-tile/build/bin
 # MLIR's and cuda-tile's Python bindings (e0358.py imports both)
 export PYTHONPATH=$LLVM_BUILD/tools/mlir/python_packages/mlir_core:$ROOT/cuda-tile/build/python_packages\${PYTHONPATH:+:\$PYTHONPATH}
 ENV
+if [ "$E0358_CUDA" = ON ]; then
+  # the backend runs tileiras, which is in the CUDA Toolkit's bin
+  echo "export PATH=$(dirname "$(command -v nvcc)"):\$PATH" >> "$ENV_FILE"
+fi
 
 echo "== done"
 "$LLVM_BUILD/bin/mlir-opt" --version | sed -n 2p
