@@ -23,7 +23,7 @@ LLVM_BIN = Path(os.environ["E0358_LLVM_BIN"]).expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
 LLVM_LIB = Path(os.environ["E0358_LLVM_LIB"]).expanduser()
 # holds cuda-tile-translate, which writes the kernels' bytecode
-CUDA_TILE_BIN = Path(os.environ.get("E0358_CUDA_TILE_BIN", "")).expanduser()
+CUDA_TILE_BIN = Path(os.environ["E0358_CUDA_TILE_BIN"]).expanduser()
 # compiler driver used to link the kernel object into a shared library; the
 # cpu path needs clang (its -fopenmp provides the __kmpc_* runtime)
 CC = os.environ.get("E0358_CC", "clang")
@@ -34,8 +34,10 @@ GPU_TILE_SIZES = os.environ.get("E0358_GPU_TILE_SIZES", "256")
 # nvidia target for the gpu path (e.g., sm_86)
 GPU_CHIP = os.environ.get("E0358_GPU_CHIP")
 
-# prefix of the IR files written at each stage: artifacts/<script>.<stage>
-ARTIFACTS = f"artifacts/{Path(sys.argv[0]).stem or 'e0358'}"
+SCRIPT = Path(sys.argv[0]).stem or "e0358"
+ARTIFACTS = f"artifacts/{SCRIPT}"
+# assignment 1's test scripts; all others take the assignment 2 path
+ASSIGNMENT_1_SCRIPTS = {"broadcast-n-consumers", "truncate-n-consumers"}
 
 # CUDA Tile IR element types of the memref element types
 TILE_TYPES = {"f32": ct.Float32, "f16": ct.Float16, "bf16": ct.BFloat16}
@@ -399,87 +401,122 @@ def check_no_host_allocs(path):
         )
 
 
-@torch._dynamo.register_backend(name="e0358")
-def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
-    sample_inputs = tuple(example_inputs)
-    device = example_inputs[0].device
-    # only queried on cuda: the cpu path must work without a gpu
-    chip = gpu_chip(device) if device.type == "cuda" else None
-    # export to torch.export fx graph
-    exported = export(gm, sample_inputs)
+def run(*cmd):
+    """Runs one tool invocation, raising on failure."""
+    subprocess.run([str(c) for c in cmd], check=True, capture_output=True)
 
-    # exported to StableHLO format
-    stablehlo_program = exported_program_to_stablehlo(exported)
-    stable_hlo_text = stablehlo_program.get_stablehlo_text("forward")
-    print(stable_hlo_text, "\n...")
 
-    Path("artifacts").mkdir(parents=True, exist_ok=True)
-    with open(f"{ARTIFACTS}.stablehlo.mlir", "w") as f:
-        f.write(stable_hlo_text)
+def compile_tile(device):
+    """Assignment 2: CUDA Tile IR kernels for a function of matmuls, siblings
+    fused when E0358_SIBLING_FUSION=1."""
+    fusion = os.environ.get("E0358_SIBLING_FUSION") == "1"
+    ir, launches = lower_to_tile(f"{ARTIFACTS}.loops.mlir", fusion)
+    if device.type != "cuda":
+        raise RuntimeError("matmuls compile to CUDA Tile IR and need a GPU")
+    mlir_file = Path(f"{ARTIFACTS}.tile.mlir")
+    mlir_file.write_text(ir)
+    work = Path(tempfile.mkdtemp(prefix="e0358-"))
+    bytecode, cubin = work / "kernels.tilebc", work / "kernels.cubin"
+    # the bindings' bytecode writer only writes the newest version (13.4),
+    # newer than tileiras of CUDA 13.2 reads
+    translate = CUDA_TILE_BIN / "cuda-tile-translate"
+    run(
+        translate,
+        "--mlir-to-cudatilebc",
+        "--no-implicit-module",
+        "--bytecode-version=13.2",
+        mlir_file,
+        "-o",
+        bytecode,
+    )
+    run("tileiras", f"--gpu-name={gpu_chip(device)}", bytecode, "-o", cubin)
+    return Kernels(cubin, launches)
 
-    fusion_mode = os.environ.get("E0358_FUSION_MODE", "greedy")
+
+def compile_affine(device):
+    """Assignment 1: fuses the affine loops, then compiles them for the cpu
+    (vectorized, OpenMP) or the gpu (one thread per iteration) into a shared
+    library."""
+    fusion = os.environ.get("E0358_FUSION_MODE", "greedy")
     fusion_pass = (
         "--canonicalize"
-        if fusion_mode == "none"
-        else f"--affine-loop-fusion=mode={fusion_mode}"
+        if fusion == "none"
+        else f"--affine-loop-fusion=mode={fusion}"
     )
-    if fusion_mode == "producer":
+    if fusion == "producer":
         tolerance = os.environ.get("E0358_COMPUTE_TOLERANCE", "0.25")
         fusion_pass += f" compute-tolerance={tolerance}"
+    affine = f"{ARTIFACTS}.affine.mlir"
+    loops = f"{ARTIFACTS}.loops.mlir"
+    run(
+        LLVM_BIN / "mlir-opt",
+        loops,
+        fusion_pass,
+        "--affine-scalrep",
+        "-o",
+        affine,
+    )
 
-    # stablehlo -> mlir -> llvm lowering pipeline to <ARTIFACTS>.*.ll; each
-    # entry is one tool invocation, run in order
-    common_pipeline = [
-        [
-            STABLEHLO_BIN / "stablehlo-opt",
-            "--stablehlo-legalize-to-linalg",
-            f"{ARTIFACTS}.stablehlo.mlir",
-            "-o",
-            f"{ARTIFACTS}.linalg.mlir",
-        ],
-        # lower linalg to affine loops
-        [
+    if device.type == "cuda":
+        # gpu.alloc/gpu.dealloc for the temporaries, which the kernels access
+        move_allocs_to_device(affine)
+        check_no_host_allocs(affine)
+        gpu = f"{ARTIFACTS}.gpu.mlir"
+        # map parallel loops to blocks/threads and outline kernels
+        run(
             LLVM_BIN / "mlir-opt",
-            f"{ARTIFACTS}.linalg.mlir",
-            "--one-shot-bufferize=bufferize-function-boundaries "
-            "function-boundary-type-conversion=identity-layout-map",
-            "--buffer-results-to-out-params="
-            "hoist-static-allocs=true modify-public-functions=true",
-            "--convert-linalg-to-affine-loops",
+            affine,
+            "--affine-loop-coalescing",
+            "--affine-parallelize",
+            "--lower-affine",
+            "--scf-parallel-loop-tiling=parallel-loop-tile-sizes="
+            + GPU_TILE_SIZES,
+            "--gpu-map-parallel-loops",
+            "--convert-parallel-loops-to-gpu",
+            "--gpu-kernel-outlining",
+            "--lower-affine",
+            "--convert-scf-to-cf",
             "--canonicalize",
             "-o",
-            f"{ARTIFACTS}.loops.mlir",
-        ],
-        # fuse
-        [
+            gpu,
+        )
+        # kernels -> nvvm -> cubin (embedded), host -> llvm + mgpu* calls
+        run(
             LLVM_BIN / "mlir-opt",
-            f"{ARTIFACTS}.loops.mlir",
-            fusion_pass,
-            "--affine-scalrep",
+            gpu,
+            "--llvm-request-c-wrappers",
+            f"--gpu-lower-to-nvvm-pipeline=cubin-chip={gpu_chip(device)} "
+            "opt-level=3",
             "-o",
-            f"{ARTIFACTS}.affine.mlir",
-        ],
-    ]
-
-    # Fused affine -> llvm ir for cpu path
-    cpu_passes = [
+            f"{ARTIFACTS}.gpu.llvm.mlir",
+        )
+        target = "gpu"
+        # mgpu* runtime wrappers that the host code calls into
+        link_flags = [
+            f"-L{LLVM_LIB}",
+            "-lmlir_cuda_runtime",
+            f"-Wl,-rpath,{LLVM_LIB}",
+        ]
+    else:
+        cpu = f"{ARTIFACTS}.cpu.affine.mlir"
         # vectorize (8 x f32 = AVX2) and parallelize the outermost loop only
-        # (nested regions cost more)
-        [
+        # (nested regions cost more); parallelize first: it can't see
+        # through vector.transfer ops
+        run(
             LLVM_BIN / "mlir-opt",
-            f"{ARTIFACTS}.affine.mlir",
-            # parallelize first: it can't see through vector.transfer ops
+            affine,
             "--affine-parallelize=max-nested=1",
             "--affine-super-vectorize=virtual-vector-size=8",
             "-o",
-            f"{ARTIFACTS}.cpu.affine.mlir",
-        ],
+            cpu,
+        )
         # lower to llvm dialect; parallel loops run on OpenMP threads.
-        # canonicalize drops the empty memref.alloca_scope that scf-to-openmp
-        # wraps around the body, which scf-to-cf would otherwise break
-        [
+        # canonicalize drops the empty memref.alloca_scope that
+        # scf-to-openmp wraps around the body, which scf-to-cf would
+        # otherwise break
+        run(
             LLVM_BIN / "mlir-opt",
-            f"{ARTIFACTS}.cpu.affine.mlir",
+            cpu,
             "--llvm-request-c-wrappers",
             "--lower-affine",
             "--convert-vector-to-scf",
@@ -497,157 +534,65 @@ def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
             "--reconcile-unrealized-casts",
             "-o",
             f"{ARTIFACTS}.cpu.llvm.mlir",
-        ],
-        [
-            LLVM_BIN / "mlir-translate",
-            "--mlir-to-llvmir",
-            f"{ARTIFACTS}.cpu.llvm.mlir",
-            "-o",
-            f"{ARTIFACTS}.cpu.ll",
-        ],
-    ]
-
-    # fused affine -> llvm ir for gpu path
-    gpu_passes = [
-        # map parallel loops to blocks/threads and outline kernels
-        [
-            LLVM_BIN / "mlir-opt",
-            f"{ARTIFACTS}.affine.mlir",
-            "--affine-loop-coalescing",
-            "--affine-parallelize",
-            "--lower-affine",
-            f"--scf-parallel-loop-tiling=parallel-loop-tile-sizes="
-            f"{GPU_TILE_SIZES}",
-            "--gpu-map-parallel-loops",
-            "--convert-parallel-loops-to-gpu",
-            "--gpu-kernel-outlining",
-            "--lower-affine",
-            "--convert-scf-to-cf",
-            "--canonicalize",
-            "-o",
-            f"{ARTIFACTS}.gpu.mlir",
-        ],
-        # kernels -> nvvm -> cubin (embedded), host -> llvm + mgpu* calls
-        [
-            LLVM_BIN / "mlir-opt",
-            f"{ARTIFACTS}.gpu.mlir",
-            "--llvm-request-c-wrappers",
-            "--gpu-lower-to-nvvm-pipeline=" f"cubin-chip={chip} opt-level=3",
-            "-o",
-            f"{ARTIFACTS}.gpu.llvm.mlir",
-        ],
-        [
-            LLVM_BIN / "mlir-translate",
-            "--mlir-to-llvmir",
-            f"{ARTIFACTS}.gpu.llvm.mlir",
-            "-o",
-            f"{ARTIFACTS}.gpu.ll",
-        ],
-    ]
-    for cmd in common_pipeline:
-        result = subprocess.run(
-            [str(c) for c in cmd], check=True, capture_output=True, text=True
         )
-        print(result.stdout)
-        print(result.stderr)
-
-    print(Path(f"{ARTIFACTS}.affine.mlir").read_text(), "\n...")
-    meta = stablehlo_program._bundle.stablehlo_funcs[0].meta
-
-    if device.type == "cuda":
-        try:
-            return make_callable(compile_tile(chip), meta, device)
-        except ValueError as error:
-            # not made of matmuls: take the affine gpu path below
-            print(error)
-
-    if device.type == "cuda":
-        move_allocs_to_device(f"{ARTIFACTS}.affine.mlir")
-        check_no_host_allocs(f"{ARTIFACTS}.affine.mlir")
-        for cmd in gpu_passes:
-            result = subprocess.run(
-                [str(c) for c in cmd],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            print(result.stdout)
-            print(result.stderr)
-
-        ll = f"{ARTIFACTS}.gpu.ll"
-        # mgpu* runtime wrappers that the host code calls into
-        link_flags = [
-            f"-L{LLVM_LIB}",
-            "-lmlir_cuda_runtime",
-            f"-Wl,-rpath,{LLVM_LIB}",
-        ]
-    else:
-        for cmd in cpu_passes:
-            result = subprocess.run(
-                [str(c) for c in cmd],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            print(result.stdout)
-            print(result.stderr)
-
-        ll = f"{ARTIFACTS}.cpu.ll"
+        target = "cpu"
         link_flags = ["-fopenmp"]
 
-    # a fresh path per compilation: dlopen caches libraries by path
+    # llvm ir -> optimized object -> shared library, at a fresh path per
+    # compilation: dlopen caches libraries by path
+    llvm, ll = f"{ARTIFACTS}.{target}.llvm.mlir", f"{ARTIFACTS}.{target}.ll"
+    run(LLVM_BIN / "mlir-translate", "--mlir-to-llvmir", llvm, "-o", ll)
     work = Path(tempfile.mkdtemp(prefix="e0358-"))
-    subprocess.run(
-        [LLVM_BIN / "opt", "-O3", ll, "-o", work / "m.bc"],
-        check=True,
-        capture_output=True,
-        text=True,
+    bc, obj, so = (work / f"m.{x}" for x in ("bc", "o", "so"))
+    run(LLVM_BIN / "opt", "-O3", ll, "-o", bc)
+    run(
+        LLVM_BIN / "llc",
+        "-filetype=obj",
+        "--relocation-model=pic",
+        "-mcpu=native",
+        bc,
+        "-o",
+        obj,
+    )
+    run(CC, "-shared", obj, *link_flags, "-o", so)
+    return run_library(ctypes.CDLL(str(so)), device)
+
+
+@torch._dynamo.register_backend(name="e0358")
+def e0358_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
+    """Assignment 1's test scripts compile to fused affine loops on the cpu or
+    gpu; the others (assignment 2's matmuls) to CUDA Tile IR kernels."""
+    device = example_inputs[0].device
+
+    # export to StableHLO, then lower to unfused affine loops (loops.mlir),
+    # which both paths below start from
+    exported = export(gm, tuple(example_inputs))
+    stablehlo_program = exported_program_to_stablehlo(exported)
+    meta = stablehlo_program._bundle.stablehlo_funcs[0].meta
+    Path("artifacts").mkdir(exist_ok=True)
+    stablehlo = Path(f"{ARTIFACTS}.stablehlo.mlir")
+    stablehlo.write_text(stablehlo_program.get_stablehlo_text("forward"))
+    linalg = f"{ARTIFACTS}.linalg.mlir"
+    run(
+        STABLEHLO_BIN / "stablehlo-opt",
+        "--stablehlo-legalize-to-linalg",
+        stablehlo,
+        "-o",
+        linalg,
+    )
+    run(
+        LLVM_BIN / "mlir-opt",
+        linalg,
+        "--one-shot-bufferize=bufferize-function-boundaries "
+        "function-boundary-type-conversion=identity-layout-map",
+        "--buffer-results-to-out-params="
+        "hoist-static-allocs=true modify-public-functions=true",
+        "--convert-linalg-to-affine-loops",
+        "--canonicalize",
+        "-o",
+        f"{ARTIFACTS}.loops.mlir",
     )
 
-    # compile to object file
-    subprocess.run(
-        [
-            LLVM_BIN / "llc",
-            "-filetype=obj",
-            "--relocation-model=pic",
-            "-mcpu=native",
-            work / "m.bc",
-            "-o",
-            work / "m.o",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-    # link to shared object file and load
-    subprocess.run(
-        [CC, "-shared", work / "m.o", *link_flags, "-o", work / "m.so"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    lib = ctypes.CDLL(str(work / "m.so"))
-    return make_callable(run_library(lib, device), meta, device)
-
-
-def compile_tile(chip):
-    """CUDA Tile IR kernels for the matmuls of <ARTIFACTS>.loops.mlir,
-    siblings fused when E0358_SIBLING_FUSION=1."""
-    fusion = os.environ.get("E0358_SIBLING_FUSION") == "1"
-    ir, launches = lower_to_tile(f"{ARTIFACTS}.loops.mlir", fusion)
-    mlir_file = Path(f"{ARTIFACTS}.tile.mlir")
-    mlir_file.write_text(ir)
-    print(ir, "\n...")
-    work = Path(tempfile.mkdtemp(prefix="e0358-"))
-    bytecode, cubin = work / "kernels.tilebc", work / "kernels.cubin"
-    # the bindings' bytecode writer only writes the newest version (13.4),
-    # newer than tileiras of CUDA 13.2 reads
-    translate = CUDA_TILE_BIN / "cuda-tile-translate"
-    for cmd in (
-        [translate, "--mlir-to-cudatilebc", "--no-implicit-module"]
-        + ["--bytecode-version=13.2", mlir_file, "-o", bytecode],
-        ["tileiras", f"--gpu-name={chip}", bytecode, "-o", cubin],
-    ):
-        subprocess.run(cmd, check=True, capture_output=True)
-    return Kernels(cubin, launches)
+    if SCRIPT in ASSIGNMENT_1_SCRIPTS:
+        return make_callable(compile_affine(device), meta, device)
+    return make_callable(compile_tile(device), meta, device)
