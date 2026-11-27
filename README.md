@@ -167,8 +167,10 @@ On CUDA, the backend in `e0358.py` compiles a graph in these steps:
 5. `Kernels` loads the cubin with the CUDA driver API and launches the
    kernels on torch's current stream.
 
-Graphs that are not matmuls make step 3 fail and take the affine path
-instead: affine loop fusion (`patches/`), then the GPU dialect.
+The two test scripts of the previous assignment (`broadcast-n-consumers`
+and `truncate-n-consumers`) take the affine path instead: affine loop fusion
+(`patches/`), then the GPU dialect or the CPU. The CUDA Tile IR path needs a
+GPU.
 
 ### Lowering to CUDA Tile IR
 
@@ -190,8 +192,7 @@ it loads tile `(i, k)` of `a` and tile `(k, j)` of `b` through partition
 views and accumulates their `mmaf` product in an f32 tile. It then stores
 the result to tile `(i, j)` of `c`, converted with `ftof` for f16 and bf16.
 
-Tile sizes come from a sweep on the RTX 4090, and the chosen rule is within
-4% of the best tile size found for every size and dtype measured:
+Tile sizes come from sweeps on the RTX 4090:
 
 - `tk` = 16.
 - `tm` = 32 for unfused f32, otherwise 64. It drops to 32 when that leaves
@@ -199,6 +200,14 @@ Tile sizes come from a sweep on the RTX 4090, and the chosen rule is within
 - `tn` = the widest of 128, 64 and 32 that still gives every SM a block. In
   fused groups `tn` is at most 32 for f32 and 64 for 16-bit types, since each
   matmul keeps its own accumulator.
+- If there are still fewer blocks than SMs, `tm` and then `tn` halve down to
+  16. This gives bert-base, whose 512x64 outputs would otherwise make only 32
+  blocks, 128 blocks of 16x16, and made it 1.2x to 1.8x faster.
+
+Before that last step, the rule was within 4% of the best tile size found in
+the sweeps for every size and dtype. Load latency hints (1 to 10) and
+grouped ("swizzled") block order were also tried: neither helped across
+sizes and dtypes, so neither is used.
 
 ### Sibling fusion
 
@@ -219,8 +228,8 @@ launches `k0`, `k1` and `k2` without fusion, and only `k0` with fusion.
 
 ## Results
 
-Measured on an RTX 4090 (driver 595.58, CUDA 13.2, Python 3.10.12), with no
-other process on the GPU, by:
+Measured on an RTX 4090 (driver 595.58, CUDA 13.2, Python 3.10.12), each run
+started with no other process on the GPU, by:
 
 ```sh
 python qkv-projection.py --backend e0358 --reference eager --device cuda \
@@ -238,34 +247,34 @@ so `mmaf` does not round inputs to TF32.
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.026** / **0.027** | **0.135** / **0.136** | 0.397 / 0.393         |
-| inductor          | 0.067 / 0.071         | **0.135** / **0.136** | 0.397 / 0.393         |
-| tensorrt          | 0.095 / 0.102         | 0.163 / 0.162         | **0.340** / **0.343** |
-| e0358 (no fusion) | 0.171 / 0.171         | 0.593 / 0.594         | 1.245 / 1.245         |
-| e0358 (fusion)    | 0.077 / 0.077         | 0.496 / 0.496         | 0.902 / 0.903         |
+| eager             | **0.027** / **0.027** | **0.136** / **0.137** | 0.399 / 0.395         |
+| inductor          | 0.072 / 0.069         | **0.136** / **0.137** | 0.399 / 0.396         |
+| tensorrt          | 0.100 / 0.099         | 0.161 / 0.161         | **0.339** / **0.340** |
+| e0358 (no fusion) | 0.092 / 0.093         | 0.593 / 0.595         | 1.243 / 1.257         |
+| e0358 (fusion)    | 0.042 / 0.042         | 0.495 / 0.497         | 0.902 / 0.903         |
 
 **float16**
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.027** / **0.028** | **0.063** / **0.063** | **0.097** / **0.098** |
-| inductor          | 0.074 / 0.074         | 0.071 / 0.070         | **0.097** / **0.098** |
-| tensorrt          | 0.110 / 0.110         | 0.118 / 0.120         | 0.122 / 0.129         |
-| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.320         | 0.613 / 0.614         |
-| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.377 / 0.378         |
+| eager             | **0.026** / **0.027** | **0.063** / **0.063** | **0.097** / **0.098** |
+| inductor          | 0.074 / 0.073         | 0.066 / 0.069         | **0.097** / **0.098** |
+| tensorrt          | 0.114 / 0.114         | 0.122 / 0.124         | 0.127 / 0.131         |
+| e0358 (no fusion) | 0.044 / 0.044         | 0.319 / 0.319         | 0.613 / 0.613         |
+| e0358 (fusion)    | 0.032 / 0.034         | 0.239 / 0.240         | 0.377 / 0.377         |
 
 **bfloat16**
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.027** / **0.027** | **0.052** / **0.052** | **0.097** / **0.098** |
-| inductor          | 0.072 / 0.079         | 0.066 / 0.071         | **0.097** / **0.098** |
-| tensorrt          | 0.111 / 0.114         | 0.122 / 0.123         | 0.118 / 0.120         |
-| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.320         | 0.613 / 0.613         |
-| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.377 / 0.377         |
+| eager             | **0.027** / **0.028** | **0.051** / **0.052** | **0.097** / **0.098** |
+| inductor          | 0.072 / 0.076         | 0.066 / 0.069         | **0.097** / **0.098** |
+| tensorrt          | 0.111 / 0.118         | 0.121 / 0.128         | 0.122 / 0.133         |
+| e0358 (no fusion) | 0.044 / 0.045         | 0.318 / 0.320         | 0.613 / 0.614         |
+| e0358 (fusion)    | 0.031 / 0.033         | 0.239 / 0.240         | 0.376 / 0.378         |
 
 The sizes (N x d_model x d) are 512x768x64 for bert-base, 1024x1024x1024 for
-gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 1%
+gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 6%
 for e0358 and within 9% for the baselines.
 
 How the variants compare (medians):
@@ -273,20 +282,19 @@ How the variants compare (medians):
 - **Fusion vs no fusion:** fusion is faster at every size and dtype, by 2.2x
   (bert-base), 1.2x (gpt2-medium) and 1.4x (llama-7b) in float32. It saves
   two of every three loads of `x` and two of three kernel launches. The gain
-  is largest at bert-base, where each kernel has only 32 blocks for 128 SMs.
-  There the time is mostly fixed costs (launch, k-loop latency), which fusion
-  pays once instead of three times. It is smallest at gpt2-medium, where the
+  is largest at bert-base, whose kernels are small enough that their time is
+  mostly fixed costs (launch, k-loop latency), which fusion pays once instead
+  of three times. It is smallest at gpt2-medium, where the
   three 1024x1024 weight matrices, not `x`, dominate memory traffic.
-- **e0358 vs eager and Inductor:** fused e0358 is 1.4x (float16 and
-  bfloat16 bert-base) to 4.6x (bfloat16 gpt2-medium) slower than eager.
-  Inductor is slower than eager at bert-base in every dtype and at
-  gpt2-medium in float16 and bfloat16, and matches it at llama-7b. Eager's
-  matmuls are cuBLAS kernels (nsys shows `ampere_sgemm_*` for float32),
-  hand-tuned for this GPU. Each e0358 kernel is one simple k-loop that leaves
-  scheduling to `tileiras`. It has no split-k, which would help bert-base,
-  whose 512x64 outputs give only 32 blocks for 128 SMs. It has no load
-  latency hints, and its tile sizes come from a coarse sweep. In float16 it
-  reaches 27 to 34 TFLOP/s fused, against eager's 103 to 133.
+- **e0358 vs eager and Inductor:** fused e0358 is 1.15x (bfloat16
+  bert-base) to 4.7x (bfloat16 gpt2-medium) slower than eager. Inductor is
+  slower than eager at bert-base in every dtype and at gpt2-medium in float16
+  and bfloat16, and matches it at llama-7b. Eager's matmuls are cuBLAS
+  kernels (nsys shows `ampere_sgemm_*` for float32), hand-tuned for this GPU.
+  Each e0358 kernel is one simple k-loop that leaves scheduling to
+  `tileiras`; it has no split-k, and its tile sizes come from a coarse sweep.
+  In float16 it reaches 27 to 34 TFLOP/s fused at gpt2-medium and llama-7b,
+  against eager's 103 to 133.
 - **TensorRT:** it takes about 0.1 ms even at bert-base, which makes it the
   slowest baseline there. In float32 it beats eager only at llama-7b; in
   float16 and bfloat16, never.

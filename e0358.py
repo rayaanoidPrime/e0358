@@ -292,8 +292,9 @@ def fusable(x, y):
 def tile_sizes(mm, count):
     """Tile sizes (m x n x k) for a group of 'count' matmuls of mm's shape,
     picked from measurements on an RTX 4090: 16-deep k tiles, enough blocks
-    for its 128 SMs where the matrix allows it, and, in fused groups, where
-    each matmul keeps its own accumulator, narrower tiles."""
+    for its 128 SMs where the matrix allows it (tiles shrink to 16 for small
+    matrices), and, in fused groups, where each matmul keeps its own
+    accumulator, narrower tiles."""
     blocks = lambda tm, tn: (mm["m"] // tm) * (mm["n"] // tn)
     f32 = mm["t"] == "f32"
     tm = 32 if f32 and count == 1 else 64
@@ -301,6 +302,10 @@ def tile_sizes(mm, count):
         tm = 32
     tn = 128 if count == 1 else 32 if f32 else 64
     while tn > 32 and (mm["n"] % tn or blocks(tm, tn) < 128):
+        tn //= 2
+    while blocks(tm, tn) < 128 and tm > 16:
+        tm //= 2
+    while blocks(tm, tn) < 128 and tn > 16:
         tn //= 2
     if mm["m"] % tm or mm["n"] % tn or mm["k"] % 16:
         raise ValueError(f"matmul {mm} is not made of {tm}x{tn}x16 tiles")
