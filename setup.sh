@@ -220,6 +220,7 @@ cat > "$ENV_FILE" <<ENV
 export E0358_LLVM_BIN=$LLVM_BUILD/bin
 export E0358_LLVM_LIB=$LLVM_BUILD/lib
 export E0358_STABLEHLO_BIN=$ROOT/stablehlo/build/bin
+export E0358_CUDA_TILE_BIN=$ROOT/cuda-tile/build/bin
 # MLIR's and cuda-tile's Python bindings (e0358.py imports both)
 export PYTHONPATH=$LLVM_BUILD/tools/mlir/python_packages/mlir_core:$ROOT/cuda-tile/build/python_packages\${PYTHONPATH:+:\$PYTHONPATH}
 ENV

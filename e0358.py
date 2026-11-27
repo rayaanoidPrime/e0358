@@ -9,7 +9,6 @@ from mlir import ir as mlir
 import cuda_tile._mlir.dialects.cuda_tile_ops as ct
 from cuda_tile._mlir import ir as tile_ir
 from cuda_tile._mlir._mlir_libs._cuda_tile import register_dialect
-from cuda_tile._mlir._mlir_libs._cuda_tile import writeBytecode
 import ctypes
 import functools
 import os
@@ -23,6 +22,8 @@ STABLEHLO_BIN = Path(os.environ["E0358_STABLEHLO_BIN"]).expanduser()
 LLVM_BIN = Path(os.environ["E0358_LLVM_BIN"]).expanduser()
 # holds libmlir_cuda_runtime.so (needs -DMLIR_ENABLE_CUDA_RUNNER=ON)
 LLVM_LIB = Path(os.environ["E0358_LLVM_LIB"]).expanduser()
+# holds cuda-tile-translate, which writes the kernels' bytecode
+CUDA_TILE_BIN = Path(os.environ.get("E0358_CUDA_TILE_BIN", "")).expanduser()
 # compiler driver used to link the kernel object into a shared library; the
 # cpu path needs clang (its -fopenmp provides the __kmpc_* runtime)
 CC = os.environ.get("E0358_CC", "clang")
@@ -345,10 +346,10 @@ def build_kernel(name, group, tm, tn, tk):
             )
 
 
-def lower_to_tile(path, fusion, bytecode):
-    """Writes the CUDA Tile IR kernels for the matmuls of the affine file
-    'path' to the file 'bytecode', siblings fused if 'fusion'; returns the
-    IR and the kernels' launches (name, grid, parameters)."""
+def lower_to_tile(path, fusion):
+    """CUDA Tile IR kernels for the matmuls of the affine file 'path',
+    siblings fused if 'fusion'; returns their IR and launches (name, grid,
+    parameters as function argument numbers)."""
     groups = []
     for mm in matmuls(path):
         fits = lambda group: fusion and all(fusable(x, mm) for x in group)
@@ -366,12 +367,7 @@ def lower_to_tile(path, fusion, bytecode):
                 build_kernel(f"k{n}", group, tm, tn, tk)
                 args = [mm["a"]] + [x for g in group for x in (g["b"], g["c"])]
                 launches.append((f"k{n}", (mm["m"] // tm, mm["n"] // tn), args))
-        # the helpers give each op its Python source line as a name location,
-        # which the bytecode writer rejects; parsed back from its text, the
-        # (verified) module has plain file locations instead
-        module = tile_ir.Module.parse(str(module))
-        with open(bytecode, "wb") as f:
-            writeBytecode(f, module.operation)
+        module.operation.verify()
         return str(module), launches
 
 
@@ -639,11 +635,19 @@ def compile_tile(chip):
     """CUDA Tile IR kernels for the matmuls of <ARTIFACTS>.loops.mlir,
     siblings fused when E0358_SIBLING_FUSION=1."""
     fusion = os.environ.get("E0358_SIBLING_FUSION") == "1"
+    ir, launches = lower_to_tile(f"{ARTIFACTS}.loops.mlir", fusion)
+    mlir_file = Path(f"{ARTIFACTS}.tile.mlir")
+    mlir_file.write_text(ir)
+    print(ir, "\n...")
     work = Path(tempfile.mkdtemp(prefix="e0358-"))
     bytecode, cubin = work / "kernels.tilebc", work / "kernels.cubin"
-    ir, launches = lower_to_tile(f"{ARTIFACTS}.loops.mlir", fusion, bytecode)
-    Path(f"{ARTIFACTS}.tile.mlir").write_text(ir)
-    print(ir, "\n...")
-    tileiras = ["tileiras", f"--gpu-name={chip}", bytecode, "-o", cubin]
-    subprocess.run(tileiras, check=True, capture_output=True)
+    # the bindings' bytecode writer only writes the newest version (13.4),
+    # newer than tileiras of CUDA 13.2 reads
+    translate = CUDA_TILE_BIN / "cuda-tile-translate"
+    for cmd in (
+        [translate, "--mlir-to-cudatilebc", "--no-implicit-module"]
+        + ["--bytecode-version=13.2", mlir_file, "-o", bytecode],
+        ["tileiras", f"--gpu-name={chip}", bytecode, "-o", cubin],
+    ):
+        subprocess.run(cmd, check=True, capture_output=True)
     return Kernels(cubin, launches)
