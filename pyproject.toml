@@ -3,7 +3,7 @@ name = "e0358"
 version = "0.1.0"
 description = "E0358 compiler course assignments"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
     "torch==2.9.0",
     "torch-tensorrt==2.9.0",
@@ -43,6 +43,10 @@ url = "https://pypi.nvidia.com"
 explicit = true
 
 [tool.uv]
+# use the machine's own Python (3.12 on the laptop, 3.10 on the RTX 4090
+# server): the MLIR and cuda-tile Python bindings are built for it, and
+# uv-managed Pythons keep libpython where torch-xla does not find it
+python-preference = "only-system"
 # e0358.py is a module, imported from this directory, not an installed package
 package = false
 # Both machines used (laptop and GPU server) are x86_64 Linux.

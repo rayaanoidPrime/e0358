@@ -155,9 +155,10 @@ fi
 git log --oneline "$LLVM_COMMIT..HEAD"
 
 # Python bindings for e0358.py, for $PYTHON: nanobind takes its Python from
-# Python_EXECUTABLE, MLIR from Python3_EXECUTABLE; the type stubs are only
-# for editors.
-cmake -S llvm -B build "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}" \
+# Python_EXECUTABLE, MLIR from Python3_EXECUTABLE, and -U drops what an
+# earlier configure found for another Python; the type stubs are only for
+# editors.
+cmake -S llvm -B build -U "*Python*" "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}" \
   -DLLVM_ENABLE_PROJECTS=mlir \
   -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" \
   -DLLVM_ENABLE_ASSERTIONS=ON \
@@ -206,7 +207,7 @@ grep -q "$LLVM_COMMIT" cmake/IncludeLLVM.cmake ||
   echo "warning: cuda-tile $CUDA_TILE_TAG pins a different llvm commit" >&2
 # cuda-tile's bindings get their own nanobind domain, so that they load next
 # to MLIR's in one process.
-cmake -S . -B build "${CMAKE_COMMON[@]}" \
+cmake -S . -B build -U "*Python*" "${CMAKE_COMMON[@]}" \
   -DCUDA_TILE_ENABLE_CCACHE="$USE_CCACHE" \
   -DCUDA_TILE_USE_LLVM_INSTALL_DIR="$LLVM_BUILD" \
   -DCUDA_TILE_ENABLE_BINDINGS_PYTHON=ON -DMLIR_PYTHON_STUBGEN_ENABLED=OFF \
