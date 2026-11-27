@@ -106,8 +106,9 @@ git -C ~/llvm/llvm-project -c http.version=HTTP/1.1 fetch --depth 1 origin \
 source ~/llvm/e0358-env.sh
 ```
 
-This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB` and `E0358_STABLEHLO_BIN`, and
-puts the MLIR and cuda-tile Python bindings on `PYTHONPATH`.
+This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB`, `E0358_STABLEHLO_BIN` and
+`E0358_CUDA_TILE_BIN`, and puts the MLIR and cuda-tile Python bindings on
+`PYTHONPATH`.
 Depending on the machine, also set:
 
 - `LD_LIBRARY_PATH`: uv's own Python keeps `libpython3.12.so` in its install
@@ -150,9 +151,9 @@ cuda-tile v13.4.3 can write bytecode up to version 13.4, which `tileiras`
 from an older CUDA Toolkit rejects with a misleading
 `error: invalid GPU architecture: 89` (for every target, not just `sm_89`).
 The bytecode version must not be newer than the CUDA Toolkit's (13.2 on the
-RTX 4090 machine). The backend writes version 13.1, the default of
-cuda-tile's bytecode writer, which any CUDA 13 `tileiras` accepts; with
-`cuda-tile-translate`, pass `--bytecode-version=13.2` or lower.
+RTX 4090 machine). The bytecode writer in cuda-tile's Python bindings
+always writes 13.4, so the backend prints the kernels and writes their
+bytecode with `cuda-tile-translate --bytecode-version=13.2`.
 
 ## Design
 
@@ -164,10 +165,11 @@ On CUDA, the backend in `e0358.py` compiles a graph in these steps:
 2. `stablehlo-opt --stablehlo-legalize-to-linalg`, then `mlir-opt` bufferizes
    (results become out-parameters) and lowers linalg to affine loops
    (`artifacts/qkv-projection.loops.mlir`).
-3. `lower_to_tile` reads the affine matmuls with MLIR's Python bindings,
-   builds CUDA Tile IR kernels for them with cuda-tile's, and writes them as
-   bytecode (the IR is printed to `artifacts/qkv-projection.tile.mlir`).
-4. `tileiras` compiles the bytecode to a cubin for the GPU (`sm_89`).
+3. `lower_to_tile` reads the affine matmuls with MLIR's Python bindings and
+   builds CUDA Tile IR kernels for them with cuda-tile's
+   (`artifacts/qkv-projection.tile.mlir`).
+4. `cuda-tile-translate` writes them as bytecode, and `tileiras` compiles
+   that to a cubin for the GPU (`sm_89`).
 5. `Kernels` loads the cubin with the CUDA driver API and launches the
    kernels on torch's current stream.
 
@@ -242,35 +244,35 @@ so `mmaf` does not round inputs to TF32.
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.027** / **0.027** | **0.135** / **0.135** | 0.404 / 0.405         |
-| inductor          | 0.062 / 0.061         | **0.135** / 0.136     | 0.403 / 0.406         |
-| tensorrt          | 0.088 / 0.092         | 0.163 / 0.161         | **0.340** / **0.335** |
-| e0358 (no fusion) | 0.170 / 0.171         | 0.593 / 0.595         | 1.241 / 1.243         |
-| e0358 (fusion)    | 0.077 / 0.077         | 0.495 / 0.497         | 0.906 / 0.882         |
+| eager             | **0.027** / **0.027** | **0.135** / **0.135** | 0.393 / 0.405         |
+| inductor          | 0.058 / 0.064         | **0.135** / 0.136     | 0.393 / 0.406         |
+| tensorrt          | 0.092 / 0.089         | 0.162 / 0.162         | **0.339** / **0.337** |
+| e0358 (no fusion) | 0.171 / 0.172         | 0.593 / 0.597         | 1.243 / 1.250         |
+| e0358 (fusion)    | 0.077 / 0.077         | 0.495 / 0.499         | 0.861 / 0.905         |
 
 **float16**
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.025** / **0.025** | **0.063** / **0.063** | **0.097** / **0.098** |
-| inductor          | 0.063 / 0.063         | **0.063** / 0.064     | **0.097** / **0.098** |
-| tensorrt          | 0.103 / 0.107         | 0.111 / 0.114         | 0.118 / 0.120         |
-| e0358 (no fusion) | 0.067 / 0.067         | 0.321 / 0.320         | 0.615 / 0.614         |
-| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.378 / 0.378         |
+| eager             | **0.026** / **0.026** | **0.063** / **0.063** | **0.097** / **0.098** |
+| inductor          | 0.070 / 0.073         | **0.063** / 0.064     | **0.097** / **0.098** |
+| tensorrt          | 0.103 / 0.106         | 0.110 / 0.113         | 0.116 / 0.117         |
+| e0358 (no fusion) | 0.067 / 0.067         | 0.320 / 0.320         | 0.612 / 0.613         |
+| e0358 (fusion)    | 0.039 / 0.039         | 0.240 / 0.240         | 0.377 / 0.377         |
 
 **bfloat16**
 
 | variant           | bert-base             | gpt2-medium           | llama-7b              |
 |-------------------|-----------------------|-----------------------|-----------------------|
-| eager             | **0.027** / **0.027** | **0.052** / **0.052** | **0.097** / **0.098** |
-| inductor          | 0.061 / 0.066         | 0.057 / 0.063         | **0.097** / 0.099     |
-| tensorrt          | 0.105 / 0.106         | 0.113 / 0.115         | 0.111 / 0.114         |
-| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.320         | 0.612 / 0.616         |
-| e0358 (fusion)    | 0.038 / 0.039         | 0.239 / 0.240         | 0.377 / 0.378         |
+| eager             | **0.025** / **0.025** | **0.052** / **0.052** | **0.097** / **0.098** |
+| inductor          | 0.060 / 0.064         | 0.056 / 0.057         | **0.097** / **0.098** |
+| tensorrt          | 0.102 / 0.103         | 0.111 / 0.114         | 0.110 / 0.114         |
+| e0358 (no fusion) | 0.067 / 0.067         | 0.319 / 0.319         | 0.612 / 0.613         |
+| e0358 (fusion)    | 0.038 / 0.039         | 0.239 / 0.240         | 0.376 / 0.381         |
 
 The sizes (N x d_model x d) are 512x768x64 for bert-base, 1024x1024x1024 for
-gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 3%
-everywhere except Inductor in bfloat16 (up to 10%).
+gpt2-medium and 4096x4096x128 for llama-7b. Median and mean agree within 5%
+everywhere except Inductor at bert-base (up to 10%).
 
 How the variants compare (medians):
 
@@ -281,7 +283,7 @@ How the variants compare (medians):
   There the time is mostly fixed costs (launch, k-loop latency), which fusion
   pays once instead of three times. It is smallest at gpt2-medium, where the
   three 1024x1024 weight matrices, not `x`, dominate memory traffic.
-- **e0358 vs eager and Inductor:** fused e0358 is 1.4x (bfloat16 bert-base)
+- **e0358 vs eager and Inductor:** fused e0358 is 1.5x (float16 bert-base)
   to 4.6x (bfloat16 gpt2-medium) slower than eager. Inductor is slower than
   eager at bert-base in every dtype and at bfloat16 gpt2-medium, and matches
   it elsewhere. Eager's matmuls are cuBLAS kernels (nsys shows
