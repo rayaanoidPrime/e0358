@@ -481,6 +481,11 @@ Prompts:
 
 > yeah do this : let each machine use its own system Python
 
+> are these 3 fixes removed? or still needed? [followed by the three setup.sh
+> fixes for the Python bindings, pasted]
+
+> confirm and remove whatever we cna do without
+
 Short status checks during the builds ("the build still running?",
 "status", "statu", "status?", "update") and one-word confirmations ("yes")
 are not listed separately.

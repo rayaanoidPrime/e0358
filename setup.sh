@@ -154,11 +154,10 @@ else
 fi
 git log --oneline "$LLVM_COMMIT..HEAD"
 
-# Python bindings for e0358.py, for $PYTHON: nanobind takes its Python from
-# Python_EXECUTABLE, MLIR from Python3_EXECUTABLE, and -U drops what an
-# earlier configure found for another Python; the type stubs are only for
-# editors.
-cmake -S llvm -B build -U "*Python*" "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}" \
+# Python bindings for e0358.py, for $PYTHON. Their type stubs (only for
+# editors) are off: their generator runs under the system python3, which may
+# lack typing_extensions.
+cmake -S llvm -B build "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}" \
   -DLLVM_ENABLE_PROJECTS=mlir \
   -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" \
   -DLLVM_ENABLE_ASSERTIONS=ON \
@@ -167,7 +166,7 @@ cmake -S llvm -B build -U "*Python*" "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}"
   -DLLVM_CCACHE_BUILD="$USE_CCACHE" \
   -DLLVM_PARALLEL_LINK_JOBS="$LINK_JOBS" \
   -DMLIR_ENABLE_BINDINGS_PYTHON=ON -DMLIR_PYTHON_STUBGEN_ENABLED=OFF \
-  -DPython3_EXECUTABLE="$PYTHON" -DPython_EXECUTABLE="$PYTHON" \
+  -DPython3_EXECUTABLE="$PYTHON" \
   -DMLIR_ENABLE_CUDA_RUNNER="$E0358_CUDA"
 ninja -C build -j "$JOBS"
 LLVM_BUILD=$ROOT/llvm-project/build
@@ -207,11 +206,10 @@ grep -q "$LLVM_COMMIT" cmake/IncludeLLVM.cmake ||
   echo "warning: cuda-tile $CUDA_TILE_TAG pins a different llvm commit" >&2
 # cuda-tile's bindings get their own nanobind domain, so that they load next
 # to MLIR's in one process.
-cmake -S . -B build -U "*Python*" "${CMAKE_COMMON[@]}" \
+cmake -S . -B build "${CMAKE_COMMON[@]}" \
   -DCUDA_TILE_ENABLE_CCACHE="$USE_CCACHE" \
   -DCUDA_TILE_USE_LLVM_INSTALL_DIR="$LLVM_BUILD" \
-  -DCUDA_TILE_ENABLE_BINDINGS_PYTHON=ON -DMLIR_PYTHON_STUBGEN_ENABLED=OFF \
-  -DPython3_EXECUTABLE="$PYTHON" -DPython_EXECUTABLE="$PYTHON" \
+  -DCUDA_TILE_ENABLE_BINDINGS_PYTHON=ON -DPython3_EXECUTABLE="$PYTHON" \
   -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=cuda_tile
 ninja -C build -j "$JOBS"
 
