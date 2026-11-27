@@ -135,15 +135,12 @@ Appending these to `~/llvm/e0358-env.sh` keeps everything in one place.
 ### 4. Running
 
 ```sh
-uv run python qkv-projection.py --backend e0358        # Asst-2, all sizes
-uv run python broadcast-n-consumers.py --backend e0358 # Asst-1 test cases
-uv run python truncate-n-consumers.py --backend e0358
+uv run python qkv-projection.py --backend e0358   # all sizes and variants
 ```
 
-The harness sets `E0358_SIBLING_FUSION` (`0` or `1`) before each compile;
-the backend reads it on every compile. The Asst-1 scripts use
-`common_asst_1.py`, the Asst-1 version of the test utilities; `common.py` is
-the Asst-2 harness.
+`qkv-projection.py` and `common.py` (the course harness) go next to
+`e0358.py`, which they import. The harness sets `E0358_SIBLING_FUSION` (`0` or
+`1`) before each compile; the backend reads it on every compile.
 
 ### CUDA Tile bytecode version
 
@@ -172,8 +169,8 @@ On CUDA, the backend in `e0358.py` compiles a graph in these steps:
 5. `Kernels` loads the cubin with the CUDA driver API and launches the
    kernels on torch's current stream.
 
-Graphs that are not matmuls (the Asst-1 tests) make step 3 fail and take the
-Asst-1 path instead: affine loop fusion (`patches/`), then the GPU dialect.
+Graphs that are not matmuls make step 3 fail and take the affine path
+instead: affine loop fusion (`patches/`), then the GPU dialect.
 
 ### Lowering to CUDA Tile IR
 
@@ -298,23 +295,13 @@ How the variants compare (medians):
 ## AI-assisted parts
 
 The following parts were written with the help of an AI coding agent
-(Claude Code). Asst-1's affine loop fusion (`patches/`) was not
-AI-assisted.
+(Claude Code). The affine loop fusion in `patches/` was not AI-assisted.
 
-### Toolchain setup script and gpu chip override
+### Inherited setup script and gpu chip override
 
-Files: `setup.sh`, `GPU_CHIP` / `gpu_chip()` in `e0358.py`.
-
-Prompt:
-
-> Since my laptop does not have a gpu, i will check ht ecpu path fusion on
-> this laptop. I will be using a separate remote machine for my gpu builds, so
-> write a setup script that build llvm llvmorg=23.1.3 release and with my patch
-> on top and stablehlo commit 965c428908be23f05e80e3c8e7f0b1a806ac3751 dated
-> 2026-08-04 This way i have a single setup script which will build the project
-> with my commit on top as a patch. Make sure you set it up so that we checkout
-> a new branch e0358-assign-1 where we apply the patch and then build llvm and
-> stablehlo
+`setup.sh` (since rewritten, see below) and `GPU_CHIP` / `gpu_chip()` in
+`e0358.py` were first written with AI help for the previous assignment; that
+prompt is listed in its README.
 
 ### Asst-2 toolchain update
 
@@ -347,8 +334,7 @@ Prompt:
 ### GPU server setup and Python environment
 
 Files: `pyproject.toml` and `uv.lock` (torch/torch-xla 2.9.0,
-torch-tensorrt), `E0358_CC` in `e0358.py`, `common_asst_1.py`
-and the `common` import in the two Asst-1 scripts, and the Versions and Setup
+torch-tensorrt), `E0358_CC` in `e0358.py`, and the Versions and Setup
 sections above. The agent also built the toolchain and the Python
 environment on the RTX 4090 server over SSH.
 
