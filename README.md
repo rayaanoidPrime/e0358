@@ -57,7 +57,20 @@ python3 -m pip install --user cmake ninja uv
 export PATH=$HOME/.local/bin:/usr/local/cuda/bin:$PATH  # also in ~/.bashrc
 ```
 
-### 1. Toolchain: LLVM/MLIR, stablehlo, cuda-tile
+### 1. Python environment
+
+```sh
+uv sync   # Python 3.12, torch, torch-xla, torch-tensorrt 2.9.0 into .venv
+```
+
+The environment takes about 7 GB. On a machine with little space where the
+project lives, put uv's download cache on another disk:
+
+```sh
+UV_CACHE_DIR=/tmp/uv-cache-$USER UV_LINK_MODE=copy uv sync
+```
+
+### 2. Toolchain: LLVM/MLIR, stablehlo, cuda-tile
 
 ```sh
 ./setup.sh
@@ -67,9 +80,10 @@ export PATH=$HOME/.local/bin:/usr/local/cuda/bin:$PATH  # also in ~/.bashrc
 `~/llvm`), applies `patches/*.patch` on a new llvm-project branch
 `e0358-assign-2` and `patches/stablehlo/*.patch` on a stablehlo branch of the
 same name, builds LLVM/MLIR (Release with assertions, LLD, MLIR, X86 and NVPTX,
-and the MLIR CUDA runner when `nvcc` is found), stablehlo, cuda-tile, and
-`tools/e0358-tile` (against the MLIR and cuda-tile builds), and writes
-`$E0358_ROOT/e0358-env.sh` with the paths the backend reads. Rerunning it
+and the MLIR CUDA runner when `nvcc` is found), stablehlo and cuda-tile, and
+writes `$E0358_ROOT/e0358-env.sh` with the paths the backend reads. MLIR and
+cuda-tile are built with their Python bindings, for the Python of step 1
+(`.venv/bin/python`, or `E0358_PYTHON`). Rerunning it
 keeps existing branches instead of reapplying the patches.
 
 Optional environment for `setup.sh`: `E0358_ROOT`, `E0358_JOBS` (compile
@@ -86,26 +100,14 @@ git -C ~/llvm/llvm-project -c http.version=HTTP/1.1 fetch --depth 1 origin \
 ./setup.sh
 ```
 
-### 2. Python environment
-
-```sh
-uv sync   # Python 3.12, torch, torch-xla and torch-tensorrt 2.9.0 into .venv
-```
-
-The environment takes about 7 GB. On a machine with little space where the
-project lives, put uv's download cache on another disk:
-
-```sh
-UV_CACHE_DIR=/tmp/uv-cache-$USER UV_LINK_MODE=copy uv sync
-```
-
 ### 3. Environment variables
 
 ```sh
 source ~/llvm/e0358-env.sh
 ```
 
-This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB` and `E0358_STABLEHLO_BIN`.
+This sets `E0358_LLVM_BIN`, `E0358_LLVM_LIB` and `E0358_STABLEHLO_BIN`, and
+puts the MLIR and cuda-tile Python bindings on `PYTHONPATH`.
 Depending on the machine, also set:
 
 - `LD_LIBRARY_PATH`: uv's own Python keeps `libpython3.12.so` in its install
@@ -148,8 +150,8 @@ cuda-tile v13.4.3 can write bytecode up to version 13.4, which `tileiras`
 from an older CUDA Toolkit rejects with a misleading
 `error: invalid GPU architecture: 89` (for every target, not just `sm_89`).
 The bytecode version must not be newer than the CUDA Toolkit's (13.2 on the
-RTX 4090 machine). `e0358-tile` writes version 13.1, cuda-tile's default for
-its bytecode writer, which any CUDA 13 `tileiras` accepts; with
+RTX 4090 machine). The backend writes version 13.1, the default of
+cuda-tile's bytecode writer, which any CUDA 13 `tileiras` accepts; with
 `cuda-tile-translate`, pass `--bytecode-version=13.2` or lower.
 
 ## Design
@@ -162,9 +164,9 @@ On CUDA, the backend in `e0358.py` compiles a graph in these steps:
 2. `stablehlo-opt --stablehlo-legalize-to-linalg`, then `mlir-opt` bufferizes
    (results become out-parameters) and lowers linalg to affine loops
    (`artifacts/qkv-projection.loops.mlir`).
-3. `tools/e0358-tile` builds CUDA Tile IR kernels for the affine matmuls and
-   writes them as bytecode (the IR is printed to
-   `artifacts/qkv-projection.tile.mlir`).
+3. `lower_to_tile` reads the affine matmuls with MLIR's Python bindings,
+   builds CUDA Tile IR kernels for them with cuda-tile's, and writes them as
+   bytecode (the IR is printed to `artifacts/qkv-projection.tile.mlir`).
 4. `tileiras` compiles the bytecode to a cubin for the GPU (`sm_89`).
 5. `Kernels` loads the cubin with the CUDA driver API and launches the
    kernels on torch's current stream.
@@ -174,8 +176,8 @@ instead: affine loop fusion (`patches/`), then the GPU dialect.
 
 ### Lowering to CUDA Tile IR
 
-`e0358-tile` matches the two loop nests that each matmul lowers to, through
-the affine API:
+`match_zero_fill` and `match_matmul` match the two loop nests that each
+matmul lowers to, through the affine ops' Python API:
 
     for i, j: c[i, j] = 0
     for i, j, k: c[i, j] += a[i, k] * b[k, j]
@@ -184,8 +186,9 @@ with constant bounds and `a`, `b`, `c` function arguments accessed exactly at
 those indices. Any other op in the function is an error, so nothing is
 miscompiled silently.
 
-Each matmul group becomes one `cuda_tile.entry` kernel, built with the
-dialect's C++ builders and checked by its verifier. The grid has one block
+Each matmul group becomes one `cuda_tile.entry` kernel, built by
+`build_kernel` with cuda-tile's Python op builders and checked by its
+verifier. The grid has one block
 per `tm x tn` tile of `c`. Block `(i, j)` loops over `k` in steps of `tk`:
 it loads tile `(i, k)` of `a` and tile `(k, j)` of `b` through partition
 views and accumulates their `mmaf` product in an f32 tile. It then stores
@@ -203,8 +206,8 @@ Tile sizes come from a sweep on the RTX 4090, and the chosen rule is within
 
 ### Sibling fusion
 
-With `E0358_SIBLING_FUSION=1` the backend passes `--sibling-fusion`.
-`e0358-tile` then groups matmuls into one kernel when they:
+With `E0358_SIBLING_FUSION=1`, `lower_to_tile` groups matmuls into one
+kernel when they:
 
 - read the same `a` buffer,
 - have the same `m`, `n` and `k`, and
@@ -384,14 +387,16 @@ Prompts, as typed (the server's address and login details are redacted):
 
 ### CUDA Tile IR lowering, sibling fusion, and this README
 
-Files: `tools/e0358-tile/`, `Kernels`, `compile_tile`, `make_callable` and
-`run_library` in `e0358.py`, the `e0358-tile` build in `setup.sh`, and the
-Design and Results sections above.
+Files: the CUDA Tile IR lowering (`lower_to_tile` and the functions it
+calls), `Kernels`, `compile_tile`, `make_callable` and `run_library` in
+`e0358.py`, the Python bindings build in `setup.sh`, and the Design and
+Results sections above.
 The agent reviewed the student's initial plan (first prompt below) and gave
 design input. It wrote the matcher, the fusion decision and the kernel
 builder, and picked the tile sizes from sweeps it ran on the RTX 4090. A
 first version printed the kernels as text from an `mlir-translate`
-translation in the llvm patch; it was replaced by the builder-based tool.
+translation in the llvm patch; a second built them with cuda-tile's C++
+builders in an out-of-tree tool. Both were replaced by the Python bindings.
 
 Prompts:
 
@@ -425,6 +430,54 @@ Prompts:
 > with readability also check the instructions for all comparisions im sure we
 > are missing some comparisons probably inductor or something
 
+> why a shared gpu? no standalong gpu free?
+
+> yeah run the checks now
+
+> give me a reading list to understand what was done. be extremely bottoms up
+
+> how are the measurements still going its been an hour
+
+> how many new lines is the diff?
+
+> change the code of the custom backend such that its not inside
+> src/e0358.py but just the e0358.py file just like in the assignment 1
+> submission folder e0358-submission
+
+> for the measurements youre measuring the e0358 backend with 'both' fusion
+> choice, against eager as reference and the default (all) baseline choices
+> right? and iters should be default 50 and the stats median and mean i want
+> both, if it helps look at the common parse args code to understand also
+> default warmup (because why not, it cant be hurting). device cuda and dtype
+> - all. is this what youre doing ? if not do this
+
+> then update the results table in a clean manner in the readme
+
+> make the best performing values in bold for each column
+
+> why are the assignment 2 artifacts also names starting with bnc? they
+> should be qkv or something. Delete all the assignment 1 artifacts please
+
+> what are the 6 artifacts i got after running the qkv projection on cpu?
+> explain in a single line what it is and at which step its generated
+
+> are we sure these are the dependencies used? can you double check in
+> server and laptop : [followed by the Versions part of asst-2.md, pasted]
+
+> the instructions said we should need to patch stable hlo at all? so im
+> confused how come we had to do it
+
+> did we write cuTile to generate teh TILE IR?
+
+> could we have generated the TILE IR lowering using the python bindings?
+> would it have been shorter code then? The cuda-tile Python bindings
+> (-DCUDA_TILE_ENABLE_BINDINGS_PYTHON=ON) are optional; they require MLIR to
+> have been built with -DMLIR_ENABLE_BINDINGS_PYTHON=ON
+
+> i think its worth a shot, first package the files needed for assignment 2
+> submissiont into a separate folder outisde of e0358, in the readme remove
+> everything assignment 1 related
+
 Short status checks during the builds ("the build still running?",
-"status", "statu", "status?") and one-word confirmations ("yes") are not listed
-separately.
+"status", "statu", "status?", "update") and one-word confirmations ("yes")
+are not listed separately.

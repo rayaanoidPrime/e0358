@@ -17,6 +17,9 @@ dependencies = [
 [dependency-groups]
 dev = [
     "black>=26.10.1",
+    # to build the MLIR and cuda-tile Python bindings (setup.sh)
+    "nanobind>=2.9,<3.0",
+    "PyYAML>=5.4.0,<=6.0.3",
 ]
 
 # torch-tensorrt from PyPI is built for CUDA 13.0, but torch 2.9.0 from PyPI

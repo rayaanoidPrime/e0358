@@ -6,8 +6,8 @@
 #     with patches/stablehlo/*.patch (tablegen rename fix),
 #     built against the llvm above
 #   - cuda-tile at tag v13.4.3, built against the llvm above
-#   - tools/e0358-tile, built against both
-# and writes $ROOT/e0358-env.sh with the environment the backend reads.
+# with the MLIR and cuda-tile Python bindings for the project's Python (run
+# `uv sync` first), and writes $ROOT/e0358-env.sh with the environment the backend reads.
 #
 # Usage: ./setup.sh [PATCH...]
 #   PATCH defaults to patches/*.patch in this repo (git format-patch output).
@@ -20,6 +20,8 @@
 #   E0358_JOBS   compile jobs (default: nproc)
 #   E0358_LINK_JOBS  parallel link jobs for llvm (default: 2; each link of
 #                an llvm/mlir tool can take several GB of RAM)
+#   E0358_PYTHON the Python to build the bindings for (default: .venv/bin/python
+#                in this repo, which `uv sync` creates)
 set -euo pipefail
 
 LLVM_COMMIT=d6a4b2ad0b90fad43565a25f1cbcbac6e6857dde
@@ -28,6 +30,8 @@ CUDA_TILE_TAG=v13.4.3
 BRANCH=e0358-assign-2
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PYTHON=${E0358_PYTHON:-$REPO/.venv/bin/python}
+[ -x "$PYTHON" ] || { echo "error: $PYTHON not found; run uv sync first" >&2; exit 1; }
 ROOT=${E0358_ROOT:-$HOME/llvm}
 JOBS=${E0358_JOBS:-$(nproc)}
 LINK_JOBS=${E0358_LINK_JOBS:-2}
@@ -150,6 +154,9 @@ else
 fi
 git log --oneline "$LLVM_COMMIT..HEAD"
 
+# Python bindings for e0358.py, for $PYTHON: nanobind takes its Python from
+# Python_EXECUTABLE, MLIR from Python3_EXECUTABLE; the type stubs are only
+# for editors.
 cmake -S llvm -B build "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}" \
   -DLLVM_ENABLE_PROJECTS=mlir \
   -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" \
@@ -158,7 +165,8 @@ cmake -S llvm -B build "${CMAKE_COMMON[@]}" "${LLVM_CXX_FLAGS[@]}" \
   -DLLVM_INSTALL_UTILS=ON \
   -DLLVM_CCACHE_BUILD="$USE_CCACHE" \
   -DLLVM_PARALLEL_LINK_JOBS="$LINK_JOBS" \
-  -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+  -DMLIR_ENABLE_BINDINGS_PYTHON=ON -DMLIR_PYTHON_STUBGEN_ENABLED=OFF \
+  -DPython3_EXECUTABLE="$PYTHON" -DPython_EXECUTABLE="$PYTHON" \
   -DMLIR_ENABLE_CUDA_RUNNER="$E0358_CUDA"
 ninja -C build -j "$JOBS"
 LLVM_BUILD=$ROOT/llvm-project/build
@@ -196,16 +204,15 @@ git rev-parse -q --verify "refs/tags/$CUDA_TILE_TAG" >/dev/null ||
 git -c advice.detachedHead=false checkout "$CUDA_TILE_TAG"
 grep -q "$LLVM_COMMIT" cmake/IncludeLLVM.cmake ||
   echo "warning: cuda-tile $CUDA_TILE_TAG pins a different llvm commit" >&2
+# cuda-tile's bindings get their own nanobind domain, so that they load next
+# to MLIR's in one process.
 cmake -S . -B build "${CMAKE_COMMON[@]}" \
   -DCUDA_TILE_ENABLE_CCACHE="$USE_CCACHE" \
-  -DCUDA_TILE_USE_LLVM_INSTALL_DIR="$LLVM_BUILD"
+  -DCUDA_TILE_USE_LLVM_INSTALL_DIR="$LLVM_BUILD" \
+  -DCUDA_TILE_ENABLE_BINDINGS_PYTHON=ON -DMLIR_PYTHON_STUBGEN_ENABLED=OFF \
+  -DPython3_EXECUTABLE="$PYTHON" -DPython_EXECUTABLE="$PYTHON" \
+  -DMLIR_BINDINGS_PYTHON_NB_DOMAIN=cuda_tile
 ninja -C build -j "$JOBS"
-
-echo "== e0358-tile"
-cmake -S "$REPO/tools/e0358-tile" -B "$REPO/tools/e0358-tile/build" \
-  "${CMAKE_COMMON[@]}" -DLLVM_ENABLE_LLD="$USE_LLD" \
-  -DMLIR_DIR="$LLVM_BUILD/lib/cmake/mlir" -DCUDA_TILE_DIR="$ROOT/cuda-tile"
-ninja -C "$REPO/tools/e0358-tile/build"
 
 ENV_FILE=$ROOT/e0358-env.sh
 cat > "$ENV_FILE" <<ENV
@@ -213,12 +220,14 @@ cat > "$ENV_FILE" <<ENV
 export E0358_LLVM_BIN=$LLVM_BUILD/bin
 export E0358_LLVM_LIB=$LLVM_BUILD/lib
 export E0358_STABLEHLO_BIN=$ROOT/stablehlo/build/bin
+# MLIR's and cuda-tile's Python bindings (e0358.py imports both)
+export PYTHONPATH=$LLVM_BUILD/tools/mlir/python_packages/mlir_core:$ROOT/cuda-tile/build/python_packages\${PYTHONPATH:+:\$PYTHONPATH}
 ENV
 
 echo "== done"
 "$LLVM_BUILD/bin/mlir-opt" --version | sed -n 2p
 "$ROOT/stablehlo/build/bin/stablehlo-opt" --version | sed -n 2p || true
-ls "$REPO/tools/e0358-tile/build/e0358-tile"
+"$PYTHON" -c "import sys; sys.path[:0] = '$LLVM_BUILD/tools/mlir/python_packages/mlir_core $ROOT/cuda-tile/build/python_packages'.split(); import mlir.ir, cuda_tile._mlir.dialects.cuda_tile_ops; print('python bindings: ok')"
 if [ "$E0358_CUDA" = ON ]; then
   ls "$LLVM_BUILD/lib/libmlir_cuda_runtime.so"
 else
